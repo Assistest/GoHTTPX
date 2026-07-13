@@ -783,6 +783,12 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
             async with self._condition:
                 if self._closing or self._closed:
                     raise GoServiceUnavailable("Go transport 已关闭", request=request)
+            if self._session_attempt is not None and self._session_attempt.done() and not self._session_attempt_waiters:
+                try:
+                    self._session_attempt.exception()
+                except BaseException:
+                    pass
+                self._session_attempt = None
             if self._session_attempt is None:
                 self._session_attempt = asyncio.create_task(self._run_initial_session_attempt(request))
             attempt = self._session_attempt
@@ -1111,6 +1117,7 @@ class AsyncClient(httpx.AsyncClient):
         async with self._close_lock:
             if self._close_task is None:
                 self._close_task = asyncio.create_task(super().aclose())
+                self._close_task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
             close_task = self._close_task
         await asyncio.shield(close_task)
 

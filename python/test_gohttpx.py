@@ -1232,6 +1232,36 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(paths.count("/api/v1/clients"), 1)
         self.assertFalse(any(path.endswith("/requests") for path in paths))
 
+    async def test_cancelled_failed_attempt_does_not_poison_later_independent_request(self):
+        self.state.block_create = True
+        self.state.create_response = (
+            500,
+            b'{"error":{"code":"INTERNAL_ERROR","message":"create failed","retryable":false}}',
+            "application/json",
+        )
+        client = AsyncClient(go_endpoint=self.endpoint)
+        request_tasks = [
+            asyncio.create_task(client.get(f"https://target.test/{index}"))
+            for index in range(4)
+        ]
+        self.assertTrue(await asyncio.to_thread(self.state.create_started.wait, 1))
+        await asyncio.sleep(0.05)
+        for task in request_tasks:
+            task.cancel()
+        await asyncio.gather(*request_tasks, return_exceptions=True)
+        attempt = client._transport._session_attempt
+        self.state.release_create.set()
+        with self.assertRaises(GoProtocolError):
+            await asyncio.shield(attempt)
+
+        self.state.block_create = False
+        self.state.create_response = None
+        response = await client.get("https://target.test/retry")
+        await client.aclose()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.state.create_count, 2)
+
     async def test_async_concurrent_client_not_found_rebuild_is_single_flight(self):
         client = AsyncClient(go_endpoint=self.endpoint)
         await client.get("https://target.test/warm")
@@ -1324,6 +1354,39 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(error.code == "INTERNAL_ERROR" for error in errors))
         with self.assertRaises(GoProtocolError) as repeated:
             await client.aclose()
+        self.assertEqual(repeated.exception.code, "INTERNAL_ERROR")
+        self.assertEqual([call["path"] for call in self.state.calls].count("/api/v1/clients/client-1"), 1)
+
+    async def test_cancelled_only_aclose_waiter_background_error_is_observed_and_rethrown(self):
+        client = AsyncClient(go_endpoint=self.endpoint)
+        await client.get("https://target.test/warm")
+        self.state.block_requests = True
+        request_task = asyncio.create_task(client.get("https://target.test/slow"))
+        self.assertTrue(await asyncio.to_thread(self.state.request_started.wait, 1))
+        self.state.delete_response = (
+            500,
+            b'{"error":{"code":"INTERNAL_ERROR","message":"delete failed","retryable":false}}',
+            "application/json",
+        )
+        close_waiter = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0.05)
+        close_waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await close_waiter
+
+        self.state.release_request.set()
+        await request_task
+        for _ in range(100):
+            if client._close_task.done():
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(client._close_task.done())
+        await asyncio.sleep(0)
+        exception_was_unretrieved = client._close_task._log_traceback
+        with self.assertRaises(GoProtocolError) as repeated:
+            await client.aclose()
+
+        self.assertFalse(exception_was_unretrieved)
         self.assertEqual(repeated.exception.code, "INTERNAL_ERROR")
         self.assertEqual([call["path"] for call in self.state.calls].count("/api/v1/clients/client-1"), 1)
 
