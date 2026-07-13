@@ -1706,6 +1706,12 @@ class GoHTTPXE2ETests(unittest.TestCase):
                 content=b"\x00\xfftyped",
                 headers={"Content-Type": "application/octet-stream"},
             )
+            empty_headers = httpx.Headers([(b"Content-Type", b"")])
+            mixed_headers = httpx.Headers([(b"content-type", b""), (b"Content-Type", b"application/two")])
+            self.assertEqual(empty_headers.raw, [(b"Content-Type", b"")])
+            self.assertEqual(mixed_headers.raw, [(b"content-type", b""), (b"Content-Type", b"application/two")])
+            empty_raw_response = client.post(self.target_endpoint + "/raw", content=b"empty", headers=empty_headers)
+            mixed_raw_response = client.post(self.target_endpoint + "/raw", content=b"mixed", headers=mixed_headers)
 
         self.assertEqual(base64.b64decode(json_response["body_base64"]), b'{"a":1}')
         self.assertEqual(json_response["content_type"], "application/json")
@@ -1716,13 +1722,15 @@ class GoHTTPXE2ETests(unittest.TestCase):
         self.assertIn(b"file-bytes", upload)
         self.assertTrue(upload_response["content_type"].startswith("multipart/form-data; boundary="))
         with self.target_state.lock:
-            raw_calls = self.target_state.calls[3:5]
-        self.assertIsNone(dict(raw_calls[0]["headers"]).get("Content-Type"))
-        self.assertEqual(dict(raw_calls[1]["headers"])["Content-Type"], "application/octet-stream")
+            raw_calls = self.target_state.calls[3:7]
+        content_types = [[value for name, value in call["headers"] if name.lower() == "content-type"] for call in raw_calls]
+        self.assertEqual(content_types, [[], ["application/octet-stream"], [""], ["", "application/two"]])
         self.assertEqual(raw_response.content, b"\x00\xff")
         self.assertIsNone(raw_response.headers.get("content-type"))
         self.assertEqual(typed_raw_response.content, b"\x00\xfftyped")
         self.assertEqual(typed_raw_response.headers["content-type"], "application/octet-stream")
+        self.assertEqual(empty_raw_response.content, b"empty")
+        self.assertEqual(mixed_raw_response.content, b"mixed")
 
     def test_all_methods_share_the_real_request_route(self):
         with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:
@@ -1734,28 +1742,36 @@ class GoHTTPXE2ETests(unittest.TestCase):
             self.assertEqual([call["method"] for call in self.target_state.calls], ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "PURGE"])
 
     def test_concurrent_content_type_presence_does_not_cross_requests(self):
-        def send(client, index, typed):
-            headers = [("content-type", "application/one"), ("Content-Type", "application/two")] if typed else None
+        def send(client, index, kind):
+            headers = {
+                "plain": None,
+                "typed": httpx.Headers([(b"content-type", b"application/one"), (b"Content-Type", b"application/two")]),
+                "empty": httpx.Headers([(b"Content-Type", b"")]),
+                "mixed": httpx.Headers([(b"content-type", b""), (b"Content-Type", b"application/two")]),
+            }[kind]
             return client.post(
-                self.target_endpoint + f"/raw?kind={'typed' if typed else 'plain'}&index={index}",
-                content=f"payload-{index}-{typed}".encode(),
+                self.target_endpoint + f"/raw?kind={kind}&index={index}",
+                content=f"payload-{index}-{kind}".encode(),
                 headers=headers,
             )
 
         with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:
             with ThreadPoolExecutor(max_workers=8) as executor:
-                responses = [executor.submit(send, client, index, typed) for index in range(8) for typed in (False, True)]
+                responses = [executor.submit(send, client, index, kind) for index in range(12) for kind in ("plain", "typed", "empty", "mixed")]
                 self.assertTrue(all(future.result().status_code == 200 for future in responses))
 
         with self.target_state.lock:
             calls = list(self.target_state.calls)
-        self.assertEqual(len(calls), 16)
+        self.assertEqual(len(calls), 48)
+        expected = {
+            "plain": [],
+            "typed": ["application/one", "application/two"],
+            "empty": [""],
+            "mixed": ["", "application/two"],
+        }
         for call in calls:
             content_types = [value for name, value in call["headers"] if name.lower() == "content-type"]
-            if call["query"]["kind"] == ["typed"]:
-                self.assertEqual(content_types, ["application/one", "application/two"])
-            else:
-                self.assertEqual(content_types, [])
+            self.assertEqual(content_types, expected[call["query"]["kind"][0]])
 
     def test_query_headers_cookies_and_duplicate_response_headers(self):
         with Client(

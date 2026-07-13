@@ -387,8 +387,19 @@ func TestRawRequestConcurrentContentTypePresenceIsIsolated(t *testing.T) {
 		contentType []string
 		body        string
 	}
+	type contentTypeCase struct {
+		path    string
+		headers [][2]string
+		want    []string
+	}
 	const pairs = 12
-	observed := make(chan observedRequest, pairs*2)
+	tests := []contentTypeCase{
+		{path: "/plain/", headers: [][2]string{}, want: nil},
+		{path: "/typed/", headers: [][2]string{{"content-type", "application/one"}, {"CONTENT-TYPE", "application/two"}}, want: []string{"application/one", "application/two"}},
+		{path: "/empty/", headers: [][2]string{{"Content-Type", ""}}, want: []string{""}},
+		{path: "/mixed/", headers: [][2]string{{"content-type", ""}, {"Content-Type", "application/two"}}, want: []string{"", "application/two"}},
+	}
+	observed := make(chan observedRequest, pairs*len(tests))
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		observed <- observedRequest{path: r.URL.Path, contentType: r.Header.Values("Content-Type"), body: string(body)}
@@ -399,24 +410,18 @@ func TestRawRequestConcurrentContentTypePresenceIsIsolated(t *testing.T) {
 	s := newServer("", 48<<20, time.Hour)
 	clientID := addTestClient(t, s)
 	handler := s.routes()
-	errors := make(chan string, pairs*2)
+	errors := make(chan string, pairs*len(tests))
 	var requests sync.WaitGroup
 	for i := 0; i < pairs; i++ {
-		for _, typed := range []bool{false, true} {
+		for _, test := range tests {
 			requests.Add(1)
-			go func(i int, typed bool) {
+			go func(i int, test contentTypeCase) {
 				defer requests.Done()
-				path := "/plain/"
-				headers := [][2]string{}
-				if typed {
-					path = "/typed/"
-					headers = [][2]string{{"content-type", "application/one"}, {"CONTENT-TYPE", "application/two"}}
-				}
 				input, _ := json.Marshal(requestEnvelope{
 					ProtocolVersion: protocolVersion,
 					Method:          http.MethodPost,
-					URL:             target.URL + path + fmt.Sprint(i),
-					Headers:         headers,
+					URL:             target.URL + test.path + fmt.Sprint(i),
+					Headers:         test.headers,
 					BodyBase64:      base64.StdEncoding.EncodeToString([]byte("payload")),
 				})
 				response := httptest.NewRecorder()
@@ -424,7 +429,7 @@ func TestRawRequestConcurrentContentTypePresenceIsIsolated(t *testing.T) {
 				if response.Code != http.StatusOK {
 					errors <- response.Body.String()
 				}
-			}(i, typed)
+			}(i, test)
 		}
 	}
 	requests.Wait()
@@ -437,11 +442,10 @@ func TestRawRequestConcurrentContentTypePresenceIsIsolated(t *testing.T) {
 		if request.body != "payload" {
 			t.Errorf("%s body = %q", request.path, request.body)
 		}
-		if strings.HasPrefix(request.path, "/plain/") && len(request.contentType) != 0 {
-			t.Errorf("%s Content-Type = %q", request.path, request.contentType)
-		}
-		if strings.HasPrefix(request.path, "/typed/") && !reflect.DeepEqual(request.contentType, []string{"application/one", "application/two"}) {
-			t.Errorf("%s Content-Type = %q", request.path, request.contentType)
+		for _, test := range tests {
+			if strings.HasPrefix(request.path, test.path) && !reflect.DeepEqual(request.contentType, test.want) {
+				t.Errorf("%s Content-Type = %q, want %q", request.path, request.contentType, test.want)
+			}
 		}
 	}
 }
@@ -1088,6 +1092,8 @@ func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
 	}{
 		{headers: [][2]string{}, want: nil},
 		{headers: [][2]string{{"content-type", "application/one"}, {"CONTENT-TYPE", "application/two"}}, want: []string{"application/one", "application/two"}},
+		{headers: [][2]string{{"Content-Type", ""}}, want: []string{""}},
+		{headers: [][2]string{{"content-type", ""}, {"Content-Type", "application/two"}}, want: []string{"", "application/two"}},
 	} {
 		bridgeResponse := sendRawRequest(t, s.routes(), contentTypeClientID, requestEnvelope{
 			ProtocolVersion: protocolVersion,

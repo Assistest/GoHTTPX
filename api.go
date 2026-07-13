@@ -41,7 +41,12 @@ const (
 
 var errUnsupportedTLSFingerprint = errors.New("unsupported TLS fingerprint")
 
-type omitAutoContentTypeKey struct{}
+type requestContentTypeStateKey struct{}
+
+type requestContentTypeState struct {
+	present bool
+	values  []string
+}
 
 var fingerprints = map[string]utls.ClientHelloID{
 	"golang":                         utls.HelloGolang,
@@ -612,14 +617,16 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 	if targetReq.Headers == nil {
 		targetReq.Headers = make(http.Header)
 	}
-	hasContentType := false
+	contentType := requestContentTypeState{}
 	for _, pair := range headers {
 		targetReq.Headers.Add(pair[0], pair[1])
-		hasContentType = hasContentType || strings.EqualFold(pair[0], "Content-Type")
+		if strings.EqualFold(pair[0], "Content-Type") {
+			contentType.present = true
+			contentType.values = append(contentType.values, pair[1])
+		}
 	}
-	if !hasContentType {
-		ctx = context.WithValue(ctx, omitAutoContentTypeKey{}, true)
-	}
+	contentType.values = append([]string(nil), contentType.values...)
+	ctx = context.WithValue(ctx, requestContentTypeStateKey{}, contentType)
 	targetReq.SetContext(ctx)
 	if len(input.Options.HeaderOrder) > 0 {
 		targetReq.SetHeaderOrder(input.Options.HeaderOrder...)
@@ -927,8 +934,11 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 	client.GetClient().Timeout = 0
 	client.WrapRoundTripFunc(func(next req.RoundTripper) req.RoundTripFunc {
 		return func(request *req.Request) (*req.Response, error) {
-			if request.Context().Value(omitAutoContentTypeKey{}) == true {
+			if contentType, ok := request.Context().Value(requestContentTypeStateKey{}).(requestContentTypeState); ok {
 				request.Headers.Del("Content-Type")
+				if contentType.present {
+					request.Headers["Content-Type"] = append([]string(nil), contentType.values...)
+				}
 			}
 			return next.RoundTrip(request)
 		}
