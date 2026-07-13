@@ -24,10 +24,18 @@ import (
 	"time"
 
 	"github.com/imroc/req/v3"
+	"github.com/imroc/req/v3/http2"
 	utls "github.com/refraction-networking/utls"
 )
 
-const protocolVersion = 1
+const (
+	protocolVersion = 1
+	retryNone       = "none"
+	retryFixed      = "fixed"
+	retryBackoff    = "backoff"
+)
+
+var errUnsupportedTLSFingerprint = errors.New("unsupported TLS fingerprint")
 
 var fingerprints = map[string]utls.ClientHelloID{
 	"golang":                         utls.HelloGolang,
@@ -99,8 +107,74 @@ type errorResponse struct {
 }
 
 type createClientRequest struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	TLSFingerprint  string `json:"tls_fingerprint,omitempty"`
+	ProtocolVersion int             `json:"protocol_version"`
+	TLSFingerprint  string          `json:"tls_fingerprint,omitempty"`
+	Impersonate     string          `json:"impersonate,omitempty"`
+	ProxyURL        string          `json:"proxy_url,omitempty"`
+	Verify          *bool           `json:"verify,omitempty"`
+	RootCAPEM       string          `json:"root_ca_pem,omitempty"`
+	ClientCertPEM   string          `json:"client_cert_pem,omitempty"`
+	ClientKeyPEM    string          `json:"client_key_pem,omitempty"`
+	HTTPVersion     string          `json:"http_version,omitempty"`
+	KeepAlive       *bool           `json:"keep_alive,omitempty"`
+	Compression     bool            `json:"compression,omitempty"`
+	AllowGetBody    *bool           `json:"allow_get_body,omitempty"`
+	Retry           retryConfig     `json:"retry,omitempty"`
+	Transport       transportConfig `json:"transport,omitempty"`
+	HTTP2           http2Config     `json:"http2,omitempty"`
+
+	tlsFingerprintSet bool
+}
+
+type retryConfig struct {
+	Count           int    `json:"count,omitempty"`
+	Mode            string `json:"mode,omitempty"`
+	FixedIntervalMS int64  `json:"fixed_interval_ms,omitempty"`
+	BackoffMinMS    int64  `json:"backoff_min_ms,omitempty"`
+	BackoffMaxMS    int64  `json:"backoff_max_ms,omitempty"`
+	StatusCodes     []int  `json:"status_codes,omitempty"`
+}
+
+type transportConfig struct {
+	TLSHandshakeTimeoutMS   int64               `json:"tls_handshake_timeout_ms,omitempty"`
+	ResponseHeaderTimeoutMS int64               `json:"response_header_timeout_ms,omitempty"`
+	ExpectContinueTimeoutMS int64               `json:"expect_continue_timeout_ms,omitempty"`
+	IdleConnTimeoutMS       int64               `json:"idle_conn_timeout_ms,omitempty"`
+	MaxIdleConns            int                 `json:"max_idle_conns,omitempty"`
+	MaxIdleConnsPerHost     int                 `json:"max_idle_conns_per_host,omitempty"`
+	MaxConnsPerHost         int                 `json:"max_conns_per_host,omitempty"`
+	MaxResponseHeaderBytes  int64               `json:"max_response_header_bytes,omitempty"`
+	ReadBufferSize          int                 `json:"read_buffer_size,omitempty"`
+	WriteBufferSize         int                 `json:"write_buffer_size,omitempty"`
+	ProxyConnectHeaders     map[string][]string `json:"proxy_connect_headers,omitempty"`
+}
+
+type http2Setting struct {
+	ID    uint16 `json:"id"`
+	Value uint32 `json:"value"`
+}
+
+type priorityParam struct {
+	StreamDependency uint32 `json:"stream_dependency"`
+	Exclusive        bool   `json:"exclusive"`
+	Weight           uint32 `json:"weight"`
+}
+
+type priorityFrame struct {
+	StreamID uint32        `json:"stream_id"`
+	Priority priorityParam `json:"priority"`
+}
+
+type http2Config struct {
+	Settings                   []http2Setting  `json:"settings,omitempty"`
+	ConnectionFlow             *uint32         `json:"connection_flow,omitempty"`
+	HeaderPriority             *priorityParam  `json:"header_priority,omitempty"`
+	PriorityFrames             []priorityFrame `json:"priority_frames,omitempty"`
+	MaxHeaderListSize          *uint32         `json:"max_header_list_size,omitempty"`
+	StrictMaxConcurrentStreams bool            `json:"strict_max_concurrent_streams,omitempty"`
+	ReadIdleTimeoutMS          int64           `json:"read_idle_timeout_ms,omitempty"`
+	PingTimeoutMS              int64           `json:"ping_timeout_ms,omitempty"`
+	WriteByteTimeoutMS         int64           `json:"write_byte_timeout_ms,omitempty"`
 }
 
 type clientSession struct {
@@ -125,6 +199,68 @@ type requestOptions struct {
 	Trace             bool     `json:"trace,omitempty"`
 	Dump              bool     `json:"dump,omitempty"`
 	RetryCount        *int     `json:"retry_count,omitempty"`
+}
+
+func decodeStrictJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("unexpected trailing JSON value")
+	}
+	return nil
+}
+
+func (input *createClientRequest) UnmarshalJSON(data []byte) error {
+	type wire createClientRequest
+	var decoded wire
+	if err := decodeStrictJSON(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*input = createClientRequest(decoded)
+	_, input.tlsFingerprintSet = fields["tls_fingerprint"]
+	return nil
+}
+
+func (input *retryConfig) UnmarshalJSON(data []byte) error {
+	type wire retryConfig
+	return decodeStrictJSON(data, (*wire)(input))
+}
+
+func (input *transportConfig) UnmarshalJSON(data []byte) error {
+	type wire transportConfig
+	return decodeStrictJSON(data, (*wire)(input))
+}
+
+func (input *http2Setting) UnmarshalJSON(data []byte) error {
+	type wire http2Setting
+	return decodeStrictJSON(data, (*wire)(input))
+}
+
+func (input *priorityParam) UnmarshalJSON(data []byte) error {
+	type wire priorityParam
+	return decodeStrictJSON(data, (*wire)(input))
+}
+
+func (input *priorityFrame) UnmarshalJSON(data []byte) error {
+	type wire priorityFrame
+	return decodeStrictJSON(data, (*wire)(input))
+}
+
+func (input *http2Config) UnmarshalJSON(data []byte) error {
+	type wire http2Config
+	return decodeStrictJSON(data, (*wire)(input))
+}
+
+func (input *requestOptions) UnmarshalJSON(data []byte) error {
+	type wire requestOptions
+	return decodeStrictJSON(data, (*wire)(input))
 }
 
 type requestEnvelope struct {
@@ -194,7 +330,7 @@ type responseEnvelope struct {
 	HTTPVersion     string         `json:"http_version"`
 	ElapsedMS       float64        `json:"elapsed_ms"`
 	Trace           *responseTrace `json:"trace"`
-	Dump            *string        `json:"dump"`
+	Dump            *string        `json:"dump,omitempty"`
 }
 
 type server struct {
@@ -276,12 +412,19 @@ func (s *server) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "PROTOCOL_MISMATCH", Message: "unsupported protocol version"}})
 		return
 	}
-	if input.TLSFingerprint == "" {
+	if input.Impersonate == "" {
+		input.Impersonate = "none"
+	}
+	if input.TLSFingerprint == "" && input.Impersonate == "none" {
 		input.TLSFingerprint = "android_11_okhttp"
 	}
 	client, err := buildReqClient(input)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "UNSUPPORTED_FEATURE", Message: err.Error()}})
+		code := "INVALID_REQUEST"
+		if errors.Is(err, errUnsupportedTLSFingerprint) {
+			code = "UNSUPPORTED_FEATURE"
+		}
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: code, Message: err.Error()}})
 		return
 	}
 	clientID, err := newClientID()
@@ -382,9 +525,8 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 	if len(body) > 0 {
 		targetReq.SetBodyBytes(body)
 	}
-	if input.Options.Trace {
-		targetReq.EnableTrace()
-	}
+	var dump bytes.Buffer
+	applyRequestOptions(targetReq, input.Options, &dump)
 	targetReq.DisableAutoReadResponse()
 
 	response, err := targetReq.Send(input.Method, input.URL)
@@ -472,6 +614,11 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	status = response.StatusCode
+	var responseDump *string
+	if input.Options.Dump {
+		value := dump.String()
+		responseDump = &value
+	}
 	writeJSON(w, http.StatusOK, responseEnvelope{
 		ProtocolVersion: protocolVersion,
 		RequestID:       requestID,
@@ -483,7 +630,26 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 		HTTPVersion:     response.Proto,
 		ElapsedMS:       float64(response.TotalTime()) / float64(time.Millisecond),
 		Trace:           trace,
+		Dump:            responseDump,
 	})
+}
+
+func applyRequestOptions(targetReq *req.Request, options requestOptions, dump *bytes.Buffer) {
+	if options.Trace {
+		targetReq.EnableTrace()
+	}
+	if options.ForceChunked {
+		targetReq.EnableForceChunkedEncoding()
+	}
+	if options.CloseConnection {
+		targetReq.EnableCloseConnection()
+	}
+	if options.RetryCount != nil {
+		targetReq.SetRetryCount(*options.RetryCount)
+	}
+	if options.Dump {
+		targetReq.EnableDumpTo(dump)
+	}
 }
 
 func decodeRequestEnvelope(w http.ResponseWriter, r *http.Request, maxBodyBytes int64) (requestEnvelope, [][2]string, []byte, *apiError) {
@@ -540,6 +706,9 @@ func decodeRequestEnvelope(w http.ResponseWriter, r *http.Request, maxBodyBytes 
 	}
 	if input.TimeoutMS < 0 || input.TimeoutMS > 600000 {
 		return input, nil, nil, &apiError{Code: "INVALID_REQUEST", Message: "invalid request timeout"}
+	}
+	if input.Options.RetryCount != nil && (*input.Options.RetryCount < 0 || *input.Options.RetryCount > 10) {
+		return input, nil, nil, &apiError{Code: "INVALID_REQUEST", Message: "invalid request retry count"}
 	}
 	return input, headers, body, nil
 }
@@ -623,13 +792,8 @@ func classifyUpstreamError(err error) (string, bool) {
 }
 
 func buildReqClient(input createClientRequest) (*req.Client, error) {
-	fingerprint := input.TLSFingerprint
-	if fingerprint == "" {
-		fingerprint = "android_11_okhttp"
-	}
-	clientHelloID, ok := fingerprints[fingerprint]
-	if !ok {
-		return nil, fmt.Errorf("unsupported TLS fingerprint %q", fingerprint)
+	if err := validateClientConfig(input); err != nil {
+		return nil, err
 	}
 	client := req.C().
 		DisableCompression().
@@ -639,8 +803,414 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 	client.GetClient().CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	client.SetTLSFingerprint(clientHelloID)
+
+	verify := true
+	if input.Verify != nil {
+		verify = *input.Verify
+	}
+	client.GetTLSClientConfig().InsecureSkipVerify = !verify
+	if input.RootCAPEM != "" {
+		client.SetRootCertFromString(input.RootCAPEM)
+	}
+	if input.ClientCertPEM != "" {
+		certificate, _ := tls.X509KeyPair([]byte(input.ClientCertPEM), []byte(input.ClientKeyPEM))
+		client.SetCerts(certificate)
+	}
+
+	var clientHelloID utls.ClientHelloID
+	switch input.Impersonate {
+	case "chrome":
+		client.ImpersonateChrome()
+		clientHelloID = utls.HelloChrome_Auto
+	case "firefox":
+		client.ImpersonateFirefox()
+		clientHelloID = utls.HelloFirefox_Auto
+	case "safari":
+		client.ImpersonateSafari()
+		clientHelloID = utls.HelloSafari_Auto
+	default:
+		fingerprint := input.TLSFingerprint
+		if fingerprint == "" {
+			fingerprint = "android_11_okhttp"
+		}
+		clientHelloID = fingerprints[fingerprint]
+		client.SetTLSFingerprint(clientHelloID)
+	}
+	if input.ClientCertPEM != "" {
+		setClientCertificateTLSHandshake(client, clientHelloID)
+	}
+	if input.ProxyURL != "" {
+		client.SetProxyURL(input.ProxyURL)
+	}
+	switch input.HTTPVersion {
+	case "http1":
+		client.EnableForceHTTP1()
+	case "http2":
+		client.EnableForceHTTP2()
+	case "http3":
+		client.EnableForceHTTP3()
+	case "h2c":
+		client.EnableH2C()
+	default:
+		client.DisableForceHttpVersion()
+	}
+	if input.KeepAlive != nil && !*input.KeepAlive {
+		client.DisableKeepAlives()
+	} else {
+		client.EnableKeepAlives()
+	}
+	if input.Compression {
+		client.EnableCompression()
+	}
+	if input.AllowGetBody != nil && !*input.AllowGetBody {
+		client.DisableAllowGetMethodPayload()
+	} else {
+		client.EnableAllowGetMethodPayload()
+	}
+
+	transport := client.GetTransport()
+	if input.Transport.TLSHandshakeTimeoutMS != 0 {
+		transport.SetTLSHandshakeTimeout(time.Duration(input.Transport.TLSHandshakeTimeoutMS) * time.Millisecond)
+	}
+	if input.Transport.ResponseHeaderTimeoutMS != 0 {
+		transport.SetResponseHeaderTimeout(time.Duration(input.Transport.ResponseHeaderTimeoutMS) * time.Millisecond)
+	}
+	if input.Transport.ExpectContinueTimeoutMS != 0 {
+		transport.SetExpectContinueTimeout(time.Duration(input.Transport.ExpectContinueTimeoutMS) * time.Millisecond)
+	}
+	if input.Transport.IdleConnTimeoutMS != 0 {
+		transport.SetIdleConnTimeout(time.Duration(input.Transport.IdleConnTimeoutMS) * time.Millisecond)
+	}
+	if input.Transport.MaxIdleConns != 0 {
+		transport.SetMaxIdleConns(input.Transport.MaxIdleConns)
+	}
+	if input.Transport.MaxIdleConnsPerHost != 0 {
+		transport.MaxIdleConnsPerHost = input.Transport.MaxIdleConnsPerHost
+	}
+	if input.Transport.MaxConnsPerHost != 0 {
+		transport.SetMaxConnsPerHost(input.Transport.MaxConnsPerHost)
+	}
+	if input.Transport.MaxResponseHeaderBytes != 0 {
+		transport.SetMaxResponseHeaderBytes(input.Transport.MaxResponseHeaderBytes)
+	}
+	if input.Transport.ReadBufferSize != 0 {
+		transport.SetReadBufferSize(input.Transport.ReadBufferSize)
+	}
+	if input.Transport.WriteBufferSize != 0 {
+		transport.SetWriteBufferSize(input.Transport.WriteBufferSize)
+	}
+	if input.Transport.ProxyConnectHeaders != nil {
+		transport.SetProxyConnectHeader(http.Header(input.Transport.ProxyConnectHeaders))
+	}
+
+	if len(input.HTTP2.Settings) > 0 {
+		settings := make([]http2.Setting, len(input.HTTP2.Settings))
+		for i, setting := range input.HTTP2.Settings {
+			settings[i] = http2.Setting{ID: http2.SettingID(setting.ID), Val: setting.Value}
+		}
+		client.SetHTTP2SettingsFrame(settings...)
+	}
+	if input.HTTP2.ConnectionFlow != nil && *input.HTTP2.ConnectionFlow != 0 {
+		client.SetHTTP2ConnectionFlow(*input.HTTP2.ConnectionFlow)
+	}
+	if input.HTTP2.HeaderPriority != nil {
+		client.SetHTTP2HeaderPriority(toHTTP2Priority(*input.HTTP2.HeaderPriority))
+	}
+	if len(input.HTTP2.PriorityFrames) > 0 {
+		frames := make([]http2.PriorityFrame, len(input.HTTP2.PriorityFrames))
+		for i, frame := range input.HTTP2.PriorityFrames {
+			frames[i] = http2.PriorityFrame{StreamID: frame.StreamID, PriorityParam: toHTTP2Priority(frame.Priority)}
+		}
+		client.SetHTTP2PriorityFrames(frames...)
+	}
+	if input.HTTP2.MaxHeaderListSize != nil && *input.HTTP2.MaxHeaderListSize != 0 {
+		client.SetHTTP2MaxHeaderListSize(*input.HTTP2.MaxHeaderListSize)
+	}
+	if input.HTTP2.StrictMaxConcurrentStreams {
+		client.SetHTTP2StrictMaxConcurrentStreams(true)
+	}
+	if input.HTTP2.ReadIdleTimeoutMS != 0 {
+		client.SetHTTP2ReadIdleTimeout(time.Duration(input.HTTP2.ReadIdleTimeoutMS) * time.Millisecond)
+	}
+	if input.HTTP2.PingTimeoutMS != 0 {
+		client.SetHTTP2PingTimeout(time.Duration(input.HTTP2.PingTimeoutMS) * time.Millisecond)
+	}
+	if input.HTTP2.WriteByteTimeoutMS != 0 {
+		client.SetHTTP2WriteByteTimeout(time.Duration(input.HTTP2.WriteByteTimeoutMS) * time.Millisecond)
+	}
+
+	if input.Retry.Count > 0 {
+		client.SetCommonRetryCount(input.Retry.Count)
+		switch input.Retry.Mode {
+		case retryFixed:
+			client.SetCommonRetryFixedInterval(time.Duration(input.Retry.FixedIntervalMS) * time.Millisecond)
+		case retryBackoff:
+			client.SetCommonRetryBackoffInterval(time.Duration(input.Retry.BackoffMinMS)*time.Millisecond, time.Duration(input.Retry.BackoffMaxMS)*time.Millisecond)
+		}
+		if len(input.Retry.StatusCodes) > 0 {
+			statusCodes := make(map[int]struct{}, len(input.Retry.StatusCodes))
+			for _, statusCode := range input.Retry.StatusCodes {
+				statusCodes[statusCode] = struct{}{}
+			}
+			client.SetCommonRetryCondition(func(response *req.Response, err error) bool {
+				if err != nil {
+					return true
+				}
+				_, ok := statusCodes[response.StatusCode]
+				return ok
+			})
+		}
+	}
 	return client, nil
+}
+
+type clientCertificateUTLSConn struct {
+	*utls.UConn
+}
+
+func (conn *clientCertificateUTLSConn) ConnectionState() tls.ConnectionState {
+	state := conn.Conn.ConnectionState()
+	return tls.ConnectionState{
+		Version:                     state.Version,
+		HandshakeComplete:           state.HandshakeComplete,
+		DidResume:                   state.DidResume,
+		CipherSuite:                 state.CipherSuite,
+		NegotiatedProtocol:          state.NegotiatedProtocol,
+		NegotiatedProtocolIsMutual:  state.NegotiatedProtocolIsMutual,
+		ServerName:                  state.ServerName,
+		PeerCertificates:            state.PeerCertificates,
+		VerifiedChains:              state.VerifiedChains,
+		SignedCertificateTimestamps: state.SignedCertificateTimestamps,
+		OCSPResponse:                state.OCSPResponse,
+		TLSUnique:                   state.TLSUnique,
+	}
+}
+
+func setClientCertificateTLSHandshake(client *req.Client, clientHelloID utls.ClientHelloID) {
+	client.SetTLSHandshake(func(ctx context.Context, addr string, plainConn net.Conn) (net.Conn, *tls.ConnectionState, error) {
+		tlsConfig := client.GetTLSClientConfig()
+		serverName := tlsConfig.ServerName
+		if serverName == "" {
+			serverName = addr
+			if host, _, err := net.SplitHostPort(addr); err == nil {
+				serverName = host
+			}
+		}
+		certificates := make([]utls.Certificate, len(tlsConfig.Certificates))
+		for i, certificate := range tlsConfig.Certificates {
+			var signatureAlgorithms []utls.SignatureScheme
+			if len(certificate.SupportedSignatureAlgorithms) > 0 {
+				signatureAlgorithms = make([]utls.SignatureScheme, len(certificate.SupportedSignatureAlgorithms))
+				for j, algorithm := range certificate.SupportedSignatureAlgorithms {
+					signatureAlgorithms[j] = utls.SignatureScheme(algorithm)
+				}
+			}
+			certificates[i] = utls.Certificate{
+				Certificate:                  certificate.Certificate,
+				PrivateKey:                   certificate.PrivateKey,
+				SupportedSignatureAlgorithms: signatureAlgorithms,
+				OCSPStaple:                   certificate.OCSPStaple,
+				SignedCertificateTimestamps:  certificate.SignedCertificateTimestamps,
+				Leaf:                         certificate.Leaf,
+			}
+		}
+		config := &utls.Config{
+			Rand:                        tlsConfig.Rand,
+			Time:                        tlsConfig.Time,
+			Certificates:                certificates,
+			RootCAs:                     tlsConfig.RootCAs,
+			ServerName:                  serverName,
+			InsecureSkipVerify:          tlsConfig.InsecureSkipVerify,
+			NextProtos:                  append([]string(nil), tlsConfig.NextProtos...),
+			CipherSuites:                append([]uint16(nil), tlsConfig.CipherSuites...),
+			SessionTicketsDisabled:      tlsConfig.SessionTicketsDisabled,
+			MinVersion:                  tlsConfig.MinVersion,
+			MaxVersion:                  tlsConfig.MaxVersion,
+			DynamicRecordSizingDisabled: tlsConfig.DynamicRecordSizingDisabled,
+			KeyLogWriter:                tlsConfig.KeyLogWriter,
+			VerifyPeerCertificate:       tlsConfig.VerifyPeerCertificate,
+		}
+		config.GetClientCertificate = func(request *utls.CertificateRequestInfo) (*utls.Certificate, error) {
+			if err := request.SupportsCertificate(&certificates[0]); err != nil {
+				return nil, fmt.Errorf("configured client certificate is incompatible: %w", err)
+			}
+			return &certificates[0], nil
+		}
+		connection := &clientCertificateUTLSConn{utls.UClient(plainConn, config, clientHelloID)}
+		if err := connection.HandshakeContext(ctx); err != nil {
+			return nil, nil, err
+		}
+		state := connection.ConnectionState()
+		return connection, &state, nil
+	})
+}
+
+func toHTTP2Priority(input priorityParam) http2.PriorityParam {
+	return http2.PriorityParam{StreamDep: input.StreamDependency, Exclusive: input.Exclusive, Weight: uint8(input.Weight)}
+}
+
+func validateClientConfig(input createClientRequest) error {
+	impersonate := input.Impersonate
+	if impersonate == "" {
+		impersonate = "none"
+	}
+	if impersonate != "none" && impersonate != "chrome" && impersonate != "firefox" && impersonate != "safari" {
+		return fmt.Errorf("invalid impersonate value %q", input.Impersonate)
+	}
+	if impersonate != "none" && (input.tlsFingerprintSet || input.TLSFingerprint != "") {
+		return errors.New("impersonate and TLS fingerprint are mutually exclusive")
+	}
+	if impersonate == "none" {
+		fingerprint := input.TLSFingerprint
+		if fingerprint == "" {
+			fingerprint = "android_11_okhttp"
+		}
+		if _, ok := fingerprints[fingerprint]; !ok {
+			return fmt.Errorf("%w %q", errUnsupportedTLSFingerprint, fingerprint)
+		}
+	}
+	if input.ProxyURL != "" {
+		proxyURL, err := url.Parse(input.ProxyURL)
+		if err != nil || proxyURL.Host == "" || proxyURL.Scheme != "http" && proxyURL.Scheme != "https" && proxyURL.Scheme != "socks5" && proxyURL.Scheme != "socks5h" {
+			return errors.New("invalid proxy URL")
+		}
+	}
+	if input.RootCAPEM != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(input.RootCAPEM)) {
+		return errors.New("invalid root CA PEM")
+	}
+	if (input.ClientCertPEM == "") != (input.ClientKeyPEM == "") {
+		return errors.New("client certificate and key must be provided together")
+	}
+	if input.ClientCertPEM != "" {
+		if _, err := tls.X509KeyPair([]byte(input.ClientCertPEM), []byte(input.ClientKeyPEM)); err != nil {
+			return errors.New("invalid client certificate or key PEM")
+		}
+	}
+	httpVersion := input.HTTPVersion
+	if httpVersion == "" {
+		httpVersion = "auto"
+	}
+	if httpVersion != "auto" && httpVersion != "http1" && httpVersion != "http2" && httpVersion != "http3" && httpVersion != "h2c" {
+		return fmt.Errorf("invalid HTTP version %q", input.HTTPVersion)
+	}
+	if err := validateTransportConfig(input.Transport); err != nil {
+		return err
+	}
+	if err := validateHTTP2Config(input.HTTP2); err != nil {
+		return err
+	}
+	return validateRetryConfig(input.Retry)
+}
+
+func validateTransportConfig(input transportConfig) error {
+	for _, value := range []int64{input.TLSHandshakeTimeoutMS, input.ResponseHeaderTimeoutMS, input.ExpectContinueTimeoutMS, input.IdleConnTimeoutMS} {
+		if value < 0 || value > 600000 {
+			return errors.New("transport timeout must be between 0 and 600000 milliseconds")
+		}
+	}
+	for _, value := range []int{input.MaxIdleConns, input.MaxIdleConnsPerHost, input.MaxConnsPerHost} {
+		if value < 0 || value > 100000 {
+			return errors.New("transport connection count must be between 0 and 100000")
+		}
+	}
+	if input.MaxResponseHeaderBytes < 0 || input.MaxResponseHeaderBytes > 16777216 || input.ReadBufferSize < 0 || input.ReadBufferSize > 16777216 || input.WriteBufferSize < 0 || input.WriteBufferSize > 16777216 {
+		return errors.New("transport buffer size must be between 0 and 16777216")
+	}
+	for name, values := range input.ProxyConnectHeaders {
+		if !isHTTPToken(name) {
+			return errors.New("invalid proxy CONNECT header name")
+		}
+		for _, value := range values {
+			if !isHTTPHeaderValue(value) {
+				return errors.New("invalid proxy CONNECT header value")
+			}
+		}
+	}
+	return nil
+}
+
+func validateHTTP2Config(input http2Config) error {
+	seenSettings := make(map[uint16]struct{}, len(input.Settings))
+	for _, setting := range input.Settings {
+		if setting.ID < 1 || setting.ID > 6 {
+			return errors.New("HTTP/2 setting ID must be between 1 and 6")
+		}
+		if _, ok := seenSettings[setting.ID]; ok {
+			return errors.New("duplicate HTTP/2 setting ID")
+		}
+		seenSettings[setting.ID] = struct{}{}
+	}
+	if input.HeaderPriority != nil {
+		if err := validatePriority(*input.HeaderPriority); err != nil {
+			return err
+		}
+	}
+	for _, frame := range input.PriorityFrames {
+		if frame.StreamID > math.MaxInt32 {
+			return errors.New("HTTP/2 priority stream ID exceeds 31 bits")
+		}
+		if err := validatePriority(frame.Priority); err != nil {
+			return err
+		}
+	}
+	for _, value := range []int64{input.ReadIdleTimeoutMS, input.PingTimeoutMS, input.WriteByteTimeoutMS} {
+		if value < 0 || value > 600000 {
+			return errors.New("HTTP/2 timeout must be between 0 and 600000 milliseconds")
+		}
+	}
+	return nil
+}
+
+func validatePriority(input priorityParam) error {
+	if input.StreamDependency > math.MaxInt32 {
+		return errors.New("HTTP/2 priority dependency exceeds 31 bits")
+	}
+	if input.Weight > math.MaxUint8 {
+		return errors.New("HTTP/2 priority weight must be between 0 and 255")
+	}
+	return nil
+}
+
+func validateRetryConfig(input retryConfig) error {
+	mode := input.Mode
+	if mode == "" {
+		mode = retryNone
+	}
+	if input.Count < 0 || input.Count > 10 {
+		return errors.New("retry count must be between 0 and 10")
+	}
+	if input.Count == 0 && mode != retryNone || input.Count > 0 && mode == retryNone {
+		return errors.New("retry mode does not match retry count")
+	}
+	for _, value := range []int64{input.FixedIntervalMS, input.BackoffMinMS, input.BackoffMaxMS} {
+		if value < 0 || value > 600000 {
+			return errors.New("retry interval must be between 0 and 600000 milliseconds")
+		}
+	}
+	switch mode {
+	case retryNone:
+	case retryFixed:
+		if input.FixedIntervalMS == 0 {
+			return errors.New("fixed retry interval must be positive")
+		}
+	case retryBackoff:
+		if input.BackoffMinMS == 0 || input.BackoffMinMS > input.BackoffMaxMS {
+			return errors.New("retry backoff must satisfy 0 < min <= max")
+		}
+	default:
+		return fmt.Errorf("invalid retry mode %q", input.Mode)
+	}
+	seenStatusCodes := make(map[int]struct{}, len(input.StatusCodes))
+	for _, statusCode := range input.StatusCodes {
+		if statusCode < 100 || statusCode > 599 {
+			return errors.New("retry status code must be between 100 and 599")
+		}
+		if _, ok := seenStatusCodes[statusCode]; ok {
+			return errors.New("duplicate retry status code")
+		}
+		seenStatusCodes[statusCode] = struct{}{}
+	}
+	return nil
 }
 
 func newClientID() (string, error) {

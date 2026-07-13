@@ -4,9 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -706,4 +714,414 @@ func TestUpstreamErrors(t *testing.T) {
 	if code != "UPSTREAM_DNS_ERROR" || !retryable {
 		t.Fatalf("DNS classification = %q, retryable=%t", code, retryable)
 	}
+}
+
+func TestClientOptionsMapSerializableConfiguration(t *testing.T) {
+	verify := false
+	keepAlive := false
+	allowGetBody := false
+	client, err := buildReqClient(createClientRequest{
+		TLSFingerprint: "golang",
+		ProxyURL:       "http://proxy.example:8080",
+		Verify:         &verify,
+		HTTPVersion:    "auto",
+		KeepAlive:      &keepAlive,
+		Compression:    true,
+		AllowGetBody:   &allowGetBody,
+		Transport: transportConfig{
+			TLSHandshakeTimeoutMS:   1,
+			ResponseHeaderTimeoutMS: 2,
+			ExpectContinueTimeoutMS: 3,
+			IdleConnTimeoutMS:       4,
+			MaxIdleConns:            5,
+			MaxIdleConnsPerHost:     6,
+			MaxConnsPerHost:         7,
+			MaxResponseHeaderBytes:  8,
+			ReadBufferSize:          9,
+			WriteBufferSize:         10,
+			ProxyConnectHeaders:     map[string][]string{"X-Proxy": {"one", "two"}},
+		},
+		HTTP2: http2Config{
+			Settings:                   []http2Setting{{ID: 1, Value: 4096}, {ID: 6, Value: 8192}},
+			ConnectionFlow:             func() *uint32 { value := uint32(65535); return &value }(),
+			HeaderPriority:             &priorityParam{StreamDependency: 1, Exclusive: true, Weight: 2},
+			PriorityFrames:             []priorityFrame{{StreamID: 3, Priority: priorityParam{StreamDependency: 1, Weight: 4}}},
+			MaxHeaderListSize:          func() *uint32 { value := uint32(16384); return &value }(),
+			StrictMaxConcurrentStreams: true,
+			ReadIdleTimeoutMS:          11,
+			PingTimeoutMS:              12,
+			WriteByteTimeoutMS:         13,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := client.GetTransport()
+	proxy, err := transport.Proxy(&http.Request{URL: &neturl.URL{Scheme: "https", Host: "target.example"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proxy.String() != "http://proxy.example:8080" || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("proxy=%v TLS=%#v", proxy, transport.TLSClientConfig)
+	}
+	if !transport.DisableKeepAlives || transport.DisableCompression || client.AllowGetMethodPayload {
+		t.Fatalf("keepalive=%t compression=%t allow_get_body=%t", transport.DisableKeepAlives, transport.DisableCompression, client.AllowGetMethodPayload)
+	}
+	if transport.TLSHandshakeTimeout != time.Millisecond || transport.ResponseHeaderTimeout != 2*time.Millisecond || transport.ExpectContinueTimeout != 3*time.Millisecond || transport.IdleConnTimeout != 4*time.Millisecond {
+		t.Fatalf("timeouts = %#v", transport.Options)
+	}
+	if transport.MaxIdleConns != 5 || transport.MaxIdleConnsPerHost != 6 || transport.MaxConnsPerHost != 7 || transport.MaxResponseHeaderBytes != 8 || transport.ReadBufferSize != 9 || transport.WriteBufferSize != 10 {
+		t.Fatalf("transport = %#v", transport.Options)
+	}
+	if !reflect.DeepEqual(transport.ProxyConnectHeader.Values("X-Proxy"), []string{"one", "two"}) {
+		t.Fatalf("proxy connect headers = %#v", transport.ProxyConnectHeader)
+	}
+}
+
+func TestClientOptionsValidateBoundaries(t *testing.T) {
+	tests := []struct {
+		name  string
+		input createClientRequest
+	}{
+		{name: "proxy scheme", input: createClientRequest{ProxyURL: "ftp://proxy.example"}},
+		{name: "proxy host", input: createClientRequest{ProxyURL: "http:///missing"}},
+		{name: "root CA PEM", input: createClientRequest{RootCAPEM: "not PEM"}},
+		{name: "client certificate pair", input: createClientRequest{ClientCertPEM: "certificate only"}},
+		{name: "client certificate PEM", input: createClientRequest{ClientCertPEM: "bad", ClientKeyPEM: "bad"}},
+		{name: "HTTP version", input: createClientRequest{HTTPVersion: "http4"}},
+		{name: "retry count", input: createClientRequest{Retry: retryConfig{Count: 11, Mode: retryNone}}},
+		{name: "retry zero fixed", input: createClientRequest{Retry: retryConfig{Mode: retryFixed, FixedIntervalMS: 1}}},
+		{name: "retry fixed interval", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryFixed}}},
+		{name: "retry backoff order", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryBackoff, BackoffMinMS: 2, BackoffMaxMS: 1}}},
+		{name: "retry status", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{99}}}},
+		{name: "duplicate retry status", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{500, 500}}}},
+		{name: "duration negative", input: createClientRequest{Transport: transportConfig{TLSHandshakeTimeoutMS: -1}}},
+		{name: "duration large", input: createClientRequest{HTTP2: http2Config{PingTimeoutMS: 600001}}},
+		{name: "connection large", input: createClientRequest{Transport: transportConfig{MaxIdleConns: 100001}}},
+		{name: "buffer large", input: createClientRequest{Transport: transportConfig{ReadBufferSize: 16777217}}},
+		{name: "response header large", input: createClientRequest{Transport: transportConfig{MaxResponseHeaderBytes: 16777217}}},
+		{name: "setting ID", input: createClientRequest{HTTP2: http2Config{Settings: []http2Setting{{ID: 7}}}}},
+		{name: "duplicate setting", input: createClientRequest{HTTP2: http2Config{Settings: []http2Setting{{ID: 1}, {ID: 1}}}}},
+		{name: "priority dependency", input: createClientRequest{HTTP2: http2Config{HeaderPriority: &priorityParam{StreamDependency: 1 << 31}}}},
+		{name: "priority weight", input: createClientRequest{HTTP2: http2Config{HeaderPriority: &priorityParam{Weight: 256}}}},
+		{name: "priority stream", input: createClientRequest{HTTP2: http2Config{PriorityFrames: []priorityFrame{{StreamID: 1 << 31}}}}},
+		{name: "impersonate fingerprint", input: createClientRequest{TLSFingerprint: "golang", Impersonate: "chrome"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := buildReqClient(test.input); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestClientOptionsHTTPVersions(t *testing.T) {
+	for _, version := range []string{"auto", "http1", "http2", "http3", "h2c"} {
+		t.Run(version, func(t *testing.T) {
+			client, err := buildReqClient(createClientRequest{HTTPVersion: version})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.GetTransport().Options.EnableH2C; got != (version == "h2c") {
+				t.Fatalf("EnableH2C = %t", got)
+			}
+		})
+	}
+}
+
+func TestClientOptionsRetryModesAndStatusCodes(t *testing.T) {
+	for _, retry := range []retryConfig{
+		{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{503}},
+		{Count: 1, Mode: retryBackoff, BackoffMinMS: 1, BackoffMaxMS: 2, StatusCodes: []int{503}},
+	} {
+		var calls int
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			if calls == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		client, err := buildReqClient(createClientRequest{Retry: retry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.R().Get(target.URL)
+		target.Close()
+		if err != nil || response.StatusCode != http.StatusNoContent || calls != 2 {
+			t.Fatalf("response=%v err=%v calls=%d", response, err, calls)
+		}
+	}
+}
+
+func TestClientOptionsStrictNestedJSONAndInvalidConfigurationCode(t *testing.T) {
+	for _, body := range []string{
+		`{"protocol_version":1,"retry":{"unknown":1}}`,
+		`{"protocol_version":1,"transport":{"unknown":1}}`,
+		`{"protocol_version":1,"http2":{"settings":[{"id":1,"value":1,"unknown":1}]}}`,
+		`{"protocol_version":1,"proxy_url":"ftp://proxy.example"}`,
+		`{"protocol_version":1,"impersonate":"chrome","tls_fingerprint":"golang"}`,
+	} {
+		s := newServer("", 48<<20, time.Hour)
+		response := httptest.NewRecorder()
+		s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(body)))
+		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
+			t.Fatalf("body=%s status=%d response=%s", body, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestRequestOptionsMapChunkedCloseRetryTraceAndDump(t *testing.T) {
+	var calls int
+	var closed bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		closed = r.Close
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("dump body"))
+	}))
+	defer target.Close()
+	s := newServer("", 48<<20, time.Hour)
+	client, err := buildReqClient(createClientRequest{Retry: retryConfig{Count: 2, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{503}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	options := requestOptions{ForceChunked: true, CloseConnection: true, RetryCount: &zero, Trace: true, Dump: true}
+	mappedRequest := client.R()
+	var mappedDump bytes.Buffer
+	applyRequestOptions(mappedRequest, options, &mappedDump)
+	mappedValue := reflect.ValueOf(mappedRequest).Elem()
+	if !mappedValue.FieldByName("forceChunkedEncoding").Bool() || !mappedValue.FieldByName("close").Bool() || mappedValue.FieldByName("retryOption").Elem().FieldByName("MaxRetries").Int() != 0 {
+		t.Fatal("request options were not mapped to req.Request")
+	}
+	const clientID = "advanced-request"
+	s.clients[clientID] = &clientSession{client: client, lastUsed: time.Now()}
+	response := sendRawRequest(t, s.routes(), clientID, requestEnvelope{
+		ProtocolVersion: protocolVersion,
+		Method:          http.MethodPost,
+		URL:             target.URL,
+		BodyBase64:      base64.StdEncoding.EncodeToString([]byte("request body")),
+		Options:         options,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result responseEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || !closed || result.Trace == nil || result.Dump == nil || !strings.Contains(*result.Dump, "dump body") {
+		t.Fatalf("calls=%d closed=%t trace=%#v dump=%v", calls, closed, result.Trace, result.Dump)
+	}
+}
+
+func TestRequestOptionsValidateRetryOverride(t *testing.T) {
+	for _, count := range []int{-1, 11} {
+		s := newServer("", 48<<20, time.Hour)
+		response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{
+			ProtocolVersion: protocolVersion,
+			Method:          http.MethodGet,
+			URL:             "http://example.com",
+			Options:         requestOptions{RetryCount: &count},
+		})
+		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
+			t.Fatalf("count=%d status=%d body=%s", count, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestRequestOptionsOmitDisabledDump(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	s := newServer("", 48<<20, time.Hour)
+	response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: target.URL})
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wire["dump"]; ok {
+		t.Fatalf("disabled dump must be omitted: %s", response.Body.String())
+	}
+}
+
+func TestClientOptionsFingerprintWithMTLS(t *testing.T) {
+	trustedCA, trustedCAPEM, trustedCAKey := newTestCA(t, "trusted CA")
+	untrustedCA, untrustedCAPEM, untrustedCAKey := newTestCA(t, "untrusted CA")
+	serverCertificate, _, _ := newTestCertificate(t, trustedCA, trustedCAKey, "server", true)
+	_, clientCertPEM, clientKeyPEM := newTestCertificate(t, trustedCA, trustedCAKey, "trusted client", false)
+	_, untrustedClientCertPEM, untrustedClientKeyPEM := newTestCertificate(t, untrustedCA, untrustedCAKey, "untrusted client", false)
+
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AddCert(trustedCA)
+	target := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.TLS.PeerCertificates) != 1 || r.TLS.PeerCertificates[0].Subject.CommonName != "trusted client" {
+			t.Errorf("peer certificates = %#v", r.TLS.PeerCertificates)
+		}
+		if strings.HasPrefix(r.Host, "localhost:") && r.TLS.ServerName != "localhost" {
+			t.Errorf("SNI = %q", r.TLS.ServerName)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	target.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCertificate},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAPool,
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+	target.EnableHTTP2 = true
+	target.StartTLS()
+	defer target.Close()
+
+	verifyFalse := false
+	for _, test := range []struct {
+		input      createClientRequest
+		protoMajor int
+	}{
+		{input: createClientRequest{TLSFingerprint: "chrome_120", RootCAPEM: trustedCAPEM, ClientCertPEM: clientCertPEM, ClientKeyPEM: clientKeyPEM}, protoMajor: 2},
+		{input: createClientRequest{Impersonate: "chrome", RootCAPEM: trustedCAPEM, ClientCertPEM: clientCertPEM, ClientKeyPEM: clientKeyPEM}, protoMajor: 2},
+		{input: createClientRequest{TLSFingerprint: "chrome_120", Verify: &verifyFalse, ClientCertPEM: clientCertPEM, ClientKeyPEM: clientKeyPEM}, protoMajor: 2},
+	} {
+		client, err := buildReqClient(test.input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.R().Get(target.URL)
+		if err != nil || response.StatusCode != http.StatusNoContent || response.ProtoMajor != test.protoMajor {
+			t.Fatalf("input=%#v response=%v err=%v", test.input, response, err)
+		}
+	}
+	sniClient, err := buildReqClient(createClientRequest{TLSFingerprint: "chrome_120", RootCAPEM: trustedCAPEM, ClientCertPEM: clientCertPEM, ClientKeyPEM: clientKeyPEM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sniClient.R().Get(strings.Replace(target.URL, "127.0.0.1", "localhost", 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		upstream, err := net.Dial("tcp", r.Host)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		downstream, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			upstream.Close()
+			return
+		}
+		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buffered.Flush()
+		go func() {
+			_, _ = io.Copy(upstream, downstream)
+			_ = upstream.Close()
+		}()
+		_, _ = io.Copy(downstream, upstream)
+		_ = downstream.Close()
+	}))
+	proxiedClient, err := buildReqClient(createClientRequest{TLSFingerprint: "chrome_120", ProxyURL: proxy.URL, RootCAPEM: trustedCAPEM, ClientCertPEM: clientCertPEM, ClientKeyPEM: clientKeyPEM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxiedResponse, err := proxiedClient.R().Get(target.URL)
+	proxy.Close()
+	if err != nil || proxiedResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("proxied response=%v err=%v", proxiedResponse, err)
+	}
+
+	failures := []createClientRequest{
+		{TLSFingerprint: "chrome_120", RootCAPEM: trustedCAPEM, HTTPVersion: "http1"},
+		{TLSFingerprint: "chrome_120", RootCAPEM: trustedCAPEM, ClientCertPEM: untrustedClientCertPEM, ClientKeyPEM: untrustedClientKeyPEM, HTTPVersion: "http1"},
+		{TLSFingerprint: "chrome_120", RootCAPEM: untrustedCAPEM, ClientCertPEM: clientCertPEM, ClientKeyPEM: clientKeyPEM, HTTPVersion: "http1"},
+	}
+	for _, input := range failures {
+		client, err := buildReqClient(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.R().Get(target.URL); err == nil {
+			t.Fatalf("input=%#v unexpectedly completed mTLS handshake", input)
+		}
+	}
+
+	untrustedClient, err := buildReqClient(failures[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer("", 48<<20, time.Hour)
+	s.clients["mtls-error"] = &clientSession{client: untrustedClient, lastUsed: time.Now()}
+	response := sendRawRequest(t, s.routes(), "mtls-error", requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: target.URL})
+	if response.Code != http.StatusBadGateway || decodeAPIError(t, response).Code != "UPSTREAM_TLS_ERROR" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func newTestCA(t *testing.T, commonName string) (*x509.Certificate, string, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certificate, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), key
+}
+
+func newTestCertificate(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, commonName string, server bool) (tls.Certificate, string, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: commonName},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	if server {
+		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		template.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+		template.DNSNames = []string{"localhost"}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificatePEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	certificate, err := tls.X509KeyPair([]byte(certificatePEM), []byte(keyPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certificate, certificatePEM, keyPEM
 }
