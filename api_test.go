@@ -22,8 +22,13 @@ import (
 	neturl "net/url"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 var expectedFingerprints = []string{
@@ -864,25 +869,140 @@ func TestClientOptionsHTTPVersions(t *testing.T) {
 	}
 }
 
-func TestClientOptionsRejectUnsupportedHTTP3(t *testing.T) {
-	if _, err := buildReqClient(createClientRequest{HTTPVersion: "http3"}); err == nil || !strings.Contains(err.Error(), "HTTP/3 is unavailable") {
-		t.Fatalf("error = %v", err)
+func TestClientOptionsH2CSendsCleartextHTTP2(t *testing.T) {
+	protocol := make(chan int, 1)
+	target := httptest.NewServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		protocol <- r.ProtoMajor
+		w.WriteHeader(http.StatusNoContent)
+	}), &http2.Server{}))
+	defer target.Close()
+
+	client, err := buildReqClient(createClientRequest{HTTPVersion: "h2c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.R().Get(target.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent || <-protocol != 2 {
+		t.Fatalf("status=%d protocol=%s", response.StatusCode, response.Proto)
+	}
+}
+
+func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
+	ca, caPEM, caKey := newTestCA(t, "HTTP3 CA")
+	serverCertificate, _, _ := newTestCertificate(t, ca, caKey, "localhost", true)
+	_, clientCertificatePEM, clientKeyPEM := newTestCertificate(t, ca, caKey, "HTTP3 client", false)
+	clientCAs := x509.NewCertPool()
+	clientCAs.AddCert(ca)
+	protocol := make(chan int, 4)
+	var retryCalls atomic.Int32
+	var handshakes atomic.Int32
+	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http3.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			protocol <- r.ProtoMajor
+			if r.URL.Path == "/retry" && retryCalls.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("retry"))
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}),
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{serverCertificate},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			ClientCAs:    clientCAs,
+			GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+				handshakes.Add(1)
+				return nil, nil
+			},
+		},
+	}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = listener.Close()
+	})
+	targetURL := "https://" + listener.LocalAddr().String()
+	verifyFalse := false
+
+	for _, input := range []createClientRequest{
+		{HTTPVersion: "http3", RootCAPEM: caPEM, ClientCertPEM: clientCertificatePEM, ClientKeyPEM: clientKeyPEM},
+		{HTTPVersion: "http3", Verify: &verifyFalse, ClientCertPEM: clientCertificatePEM, ClientKeyPEM: clientKeyPEM},
+	} {
+		client, buildErr := buildReqClient(input)
+		if buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		response, requestErr := client.R().Get(targetURL)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		if response.StatusCode != http.StatusNoContent || <-protocol != 3 {
+			t.Fatalf("status=%d protocol=%s", response.StatusCode, response.Proto)
+		}
+		client.GetClient().CloseIdleConnections()
+	}
+
+	client, err := buildReqClient(createClientRequest{
+		HTTPVersion:   "http3",
+		RootCAPEM:     caPEM,
+		ClientCertPEM: clientCertificatePEM,
+		ClientKeyPEM:  clientKeyPEM,
+		Retry:         retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{http.StatusServiceUnavailable}},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	s := newServer("", 48<<20, time.Hour)
-	response := httptest.NewRecorder()
-	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3"}`)))
-	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "HTTP/3 is unavailable") {
+	const clientID = "http3-high-level"
+	s.clients[clientID] = &clientSession{client: client, lastUsed: time.Now()}
+	response := sendRawRequest(t, s.routes(), clientID, requestEnvelope{
+		ProtocolVersion: protocolVersion,
+		Method:          http.MethodGet,
+		URL:             targetURL + "/retry",
+		Options:         requestOptions{Trace: true, Dump: true},
+	})
+	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
+	var result responseEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	firstProtocol, secondProtocol := <-protocol, <-protocol
+	if retryCalls.Load() != 2 || firstProtocol != 3 || secondProtocol != 3 || result.StatusCode != http.StatusNoContent || result.Trace == nil || result.Trace.RemoteAddress == "" || result.Dump == nil || !strings.Contains(*result.Dump, "HTTP/3.0") {
+		dump := "<nil>"
+		if result.Dump != nil {
+			dump = *result.Dump
+		}
+		t.Fatalf("calls=%d protocols=%d,%d trace=%#v dump=%q result=%#v", retryCalls.Load(), firstProtocol, secondProtocol, result.Trace, dump, result)
+	}
+	client.GetClient().CloseIdleConnections()
+	beforeClose := handshakes.Load()
+	afterClose, err := client.R().Get(targetURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterClose.StatusCode != http.StatusNoContent || <-protocol != 3 || handshakes.Load() <= beforeClose {
+		t.Fatalf("HTTP/3 connection remained after close: before=%d after=%d", beforeClose, handshakes.Load())
+	}
+	client.GetClient().CloseIdleConnections()
 }
 
 func TestClientOptionsRejectUnsafeProtocolCombinations(t *testing.T) {
 	for _, input := range []createClientRequest{
 		{HTTPVersion: "http2", ProxyURL: "http://127.0.0.1:8080"},
 		{HTTPVersion: "http3", ProxyURL: "http://127.0.0.1:8080"},
+		{HTTPVersion: "h2c", ProxyURL: "http://127.0.0.1:8080"},
 		{HTTPVersion: "http3", TLSFingerprint: "chrome_120"},
+		{HTTPVersion: "http3", TLSFingerprint: "android_11_okhttp", tlsFingerprintSet: true},
 		{HTTPVersion: "http3", Impersonate: "chrome"},
-		{HTTPVersion: "http3", ClientCertPEM: "certificate", ClientKeyPEM: "key"},
 	} {
 		if _, err := buildReqClient(input); err == nil {
 			t.Fatalf("unsafe combination accepted: %#v", input)
@@ -916,6 +1036,7 @@ func TestClientOptionsRejectNullAndInvalidRootCAPEM(t *testing.T) {
 
 	for _, body := range []string{
 		`{"protocol_version":null}`,
+		`{"protocol_version":null,"protocol_version":1}`,
 		`{"protocol_version":1,"verify":null}`,
 		`{"protocol_version":1,"tls_fingerprint":null}`,
 		`{"protocol_version":1,"retry":null}`,
@@ -931,6 +1052,43 @@ func TestClientOptionsRejectNullAndInvalidRootCAPEM(t *testing.T) {
 		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
 			t.Fatalf("null accepted: %s response=%s", body, response.Body.String())
 		}
+	}
+}
+
+func TestRejectJSONNullLexicalBoundaries(t *testing.T) {
+	for _, body := range []string{
+		`{"value":"null"}`,
+		`{"value":"escaped \\\"null\\\" text"}`,
+		`{"value":"backslash \\\\ then null"}`,
+	} {
+		if err := rejectJSONNull([]byte(body)); err != nil {
+			t.Fatalf("string content rejected: %s: %v", body, err)
+		}
+	}
+	if err := rejectJSONNull([]byte(`{"value":null,"value":1}`)); err == nil {
+		t.Fatal("duplicate-key null accepted")
+	}
+	var input createClientRequest
+	if err := json.Unmarshal([]byte(`{"protocol_version":1,"verify":tru`), &input); err == nil {
+		t.Fatal("invalid JSON accepted")
+	}
+}
+
+func TestRequestEnvelopeNearLimitDoesNotBuildGenericJSONTree(t *testing.T) {
+	body := []byte(`{"protocol_version":1,"method":"POST","url":"http://example.com","headers":[],"body_base64":"` + strings.Repeat("A", (4<<20)-1024) + `","timeout_ms":1,"options":{}}`)
+	result := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			var input requestEnvelope
+			if err := json.Unmarshal(body, &input); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	allocated := result.AllocedBytesPerOp()
+	t.Logf("decode allocated %d bytes per operation", allocated)
+	if allocated > 16<<20 {
+		t.Fatalf("decode allocated %d bytes per operation", allocated)
 	}
 }
 

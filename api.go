@@ -19,7 +19,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +26,7 @@ import (
 
 	"github.com/imroc/req/v3"
 	"github.com/imroc/req/v3/http2"
+	quichttp3 "github.com/quic-go/quic-go/http3"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -220,32 +220,26 @@ func decodeStrictJSON(data []byte, target any) error {
 }
 
 func rejectJSONNull(data []byte) error {
-	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
-		return err
-	}
-	var containsNull func(any) bool
-	containsNull = func(value any) bool {
-		switch value := value.(type) {
-		case nil:
-			return true
-		case []any:
-			for _, item := range value {
-				if containsNull(item) {
-					return true
-				}
+	inString := false
+	escaped := false
+	for i, current := range data {
+		if inString {
+			if escaped {
+				escaped = false
+			} else if current == '\\' {
+				escaped = true
+			} else if current == '"' {
+				inString = false
 			}
-		case map[string]any:
-			for _, item := range value {
-				if containsNull(item) {
-					return true
-				}
-			}
+			continue
 		}
-		return false
-	}
-	if containsNull(value) {
-		return errors.New("null is not allowed")
+		if current == '"' {
+			inString = true
+			continue
+		}
+		if current == 'n' && len(data)-i >= 4 && bytes.Equal(data[i:i+4], []byte("null")) {
+			return errors.New("null is not allowed")
+		}
 	}
 	return nil
 }
@@ -500,7 +494,7 @@ func (s *server) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 	delete(s.clients, r.PathValue("clientID"))
 	s.mu.Unlock()
 	if session != nil {
-		session.client.GetTransport().CloseIdleConnections()
+		session.client.GetClient().CloseIdleConnections()
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -625,6 +619,22 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 	if int64(len(responseBody)) > s.maxBodyBytes {
 		writeError(http.StatusBadGateway, "UPSTREAM_PROTOCOL_ERROR", "target response body exceeds limit", false)
 		return
+	}
+	if input.Options.Dump && dump.Len() == 0 {
+		_, _ = fmt.Fprintf(&dump, "%s %s %s\r\n", input.Method, input.URL, response.Proto)
+		for _, pair := range headers {
+			_, _ = fmt.Fprintf(&dump, "%s: %s\r\n", pair[0], pair[1])
+		}
+		_, _ = dump.WriteString("\r\n")
+		_, _ = dump.Write(body)
+		_, _ = fmt.Fprintf(&dump, "\r\n%s %s\r\n", response.Proto, response.Status)
+		for name, values := range response.Header {
+			for _, value := range values {
+				_, _ = fmt.Fprintf(&dump, "%s: %s\r\n", name, value)
+			}
+		}
+		_, _ = dump.WriteString("\r\n")
+		_, _ = dump.Write(responseBody)
 	}
 
 	headerNames := make([]string, 0, len(response.Header))
@@ -900,11 +910,9 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 		client.EnableForceHTTP1()
 	case "http2":
 		client.EnableForceHTTP2()
-	case "http3":
-		client.EnableForceHTTP3()
 	case "h2c":
-		client.EnableH2C()
-	default:
+		client.EnableH2C().EnableForceHTTP2()
+	case "", "auto":
 		client.DisableForceHttpVersion()
 	}
 	if input.KeepAlive != nil && !*input.KeepAlive {
@@ -951,6 +959,13 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 	}
 	if input.Transport.WriteBufferSize != 0 {
 		transport.SetWriteBufferSize(input.Transport.WriteBufferSize)
+	}
+	if input.HTTPVersion == "http3" {
+		client.GetClient().Transport = &quichttp3.Transport{
+			TLSClientConfig:        client.GetTLSClientConfig().Clone(),
+			MaxResponseHeaderBytes: int(input.Transport.MaxResponseHeaderBytes),
+			DisableCompression:     !input.Compression,
+		}
 	}
 	if input.Transport.ProxyConnectHeaders != nil {
 		transport.SetProxyConnectHeader(http.Header(input.Transport.ProxyConnectHeaders))
@@ -1148,14 +1163,11 @@ func validateClientConfig(input createClientRequest) error {
 	if httpVersion != "auto" && httpVersion != "http1" && httpVersion != "http2" && httpVersion != "http3" && httpVersion != "h2c" {
 		return fmt.Errorf("invalid HTTP version %q", input.HTTPVersion)
 	}
-	if input.ProxyURL != "" && (httpVersion == "http2" || httpVersion == "http3") {
-		return errors.New("proxy URL cannot be combined with forced HTTP/2 or HTTP/3")
+	if input.ProxyURL != "" && (httpVersion == "http2" || httpVersion == "http3" || httpVersion == "h2c") {
+		return errors.New("proxy URL cannot be combined with forced HTTP/2, HTTP/3, or H2C")
 	}
-	if httpVersion == "http3" && (input.tlsFingerprintSet || input.TLSFingerprint != "" && input.TLSFingerprint != "android_11_okhttp" || impersonate != "none" || input.ClientCertPEM != "") {
-		return errors.New("HTTP/3 cannot be combined with TLS fingerprint, impersonate, or client certificate")
-	}
-	if httpVersion == "http3" {
-		return fmt.Errorf("HTTP/3 is unavailable with req/v3 v3.48.0 on %s", runtime.Version())
+	if httpVersion == "http3" && (input.tlsFingerprintSet || input.TLSFingerprint != "" && input.TLSFingerprint != "android_11_okhttp" || impersonate != "none") {
+		return errors.New("HTTP/3 cannot be combined with TLS fingerprint or impersonate")
 	}
 	if err := validateTransportConfig(input.Transport); err != nil {
 		return err
@@ -1328,7 +1340,7 @@ func (s *server) cleanupIdleClients(now time.Time) {
 	}
 	s.mu.Unlock()
 	for _, session := range expired {
-		session.client.GetTransport().CloseIdleConnections()
+		session.client.GetClient().CloseIdleConnections()
 	}
 }
 
