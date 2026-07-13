@@ -360,6 +360,28 @@ func TestRawRequestPreservesDuplicateHeadersAndBinaryBodies(t *testing.T) {
 	}
 }
 
+func TestRawRequestUsesHostHeader(t *testing.T) {
+	var host string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host = r.Host
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	s := newServer("", 48<<20, time.Hour)
+	response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{
+		ProtocolVersion: protocolVersion,
+		Method:          http.MethodGet,
+		URL:             target.URL,
+		Headers:         [][2]string{{"host", "httpx.example"}},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("control status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if host != "httpx.example" {
+		t.Fatalf("upstream Host = %q", host)
+	}
+}
+
 func TestAllMethods(t *testing.T) {
 	var gotMethod string
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -396,6 +418,57 @@ func TestUpstreamHTTPErrorIsAResponse(t *testing.T) {
 	}
 	if result.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("upstream status = %d", result.StatusCode)
+	}
+}
+
+func TestRawRequestRejectsOversizedResponseBeforeReadingBody(t *testing.T) {
+	release := make(chan struct{})
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "5")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() {
+		close(release)
+		target.Close()
+	}()
+	s := newServer("", 4, time.Hour)
+	response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{
+		ProtocolVersion: protocolVersion,
+		Method:          http.MethodGet,
+		URL:             target.URL,
+		TimeoutMS:       100,
+	})
+	if response.Code != http.StatusBadGateway || decodeAPIError(t, response).Code != "UPSTREAM_PROTOCOL_ERROR" {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRawRequestReusesConnectionAfterBoundedRead(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+	s := newServer("", 4, time.Hour)
+	clientID := addTestClient(t, s)
+	var result responseEnvelope
+	for i := 0; i < 2; i++ {
+		response := sendRawRequest(t, s.routes(), clientID, requestEnvelope{
+			ProtocolVersion: protocolVersion,
+			Method:          http.MethodGet,
+			URL:             target.URL,
+			Options:         requestOptions{Trace: true},
+		})
+		if response.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, body = %s", i+1, response.Code, response.Body.String())
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if result.Trace == nil || !result.Trace.ConnectionReused {
+		t.Fatalf("second trace = %#v", result.Trace)
 	}
 }
 
@@ -483,6 +556,26 @@ func TestRequestValidation(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := newServer("", 48<<20, time.Hour)
 			clientID := addTestClient(t, s)
+			response := httptest.NewRecorder()
+			s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", strings.NewReader(body)))
+			if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	for name, headers := range map[string]string{
+		"short header pair": `[["X-Test"]]`,
+		"long header pair":  `[["X-Test","a","ignored"]]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newServer("", 48<<20, time.Hour)
+			clientID := addTestClient(t, s)
+			body := `{"protocol_version":1,"method":"GET","url":"` + target.URL + `","headers":` + headers + `}`
 			response := httptest.NewRecorder()
 			s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", strings.NewReader(body)))
 			if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {

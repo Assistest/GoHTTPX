@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -134,6 +135,41 @@ type requestEnvelope struct {
 	BodyBase64      string         `json:"body_base64"`
 	TimeoutMS       int64          `json:"timeout_ms"`
 	Options         requestOptions `json:"options"`
+}
+
+func (input *requestEnvelope) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		ProtocolVersion int               `json:"protocol_version"`
+		Method          string            `json:"method"`
+		URL             string            `json:"url"`
+		Headers         []json.RawMessage `json:"headers"`
+		BodyBase64      string            `json:"body_base64"`
+		TimeoutMS       int64             `json:"timeout_ms"`
+		Options         requestOptions    `json:"options"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	headers := make([][2]string, len(wire.Headers))
+	for i, rawPair := range wire.Headers {
+		var pair []string
+		if err := json.Unmarshal(rawPair, &pair); err != nil || len(pair) != 2 {
+			return fmt.Errorf("header at index %d must contain exactly two strings", i)
+		}
+		headers[i] = [2]string{pair[0], pair[1]}
+	}
+	*input = requestEnvelope{
+		ProtocolVersion: wire.ProtocolVersion,
+		Method:          wire.Method,
+		URL:             wire.URL,
+		Headers:         headers,
+		BodyBase64:      wire.BodyBase64,
+		TimeoutMS:       wire.TimeoutMS,
+		Options:         wire.Options,
+	}
+	return nil
 }
 
 type responseTrace struct {
@@ -349,9 +385,35 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 	if input.Options.Trace {
 		targetReq.EnableTrace()
 	}
+	targetReq.DisableAutoReadResponse()
 
 	response, err := targetReq.Send(input.Method, input.URL)
+	var responseBody []byte
+	if err == nil {
+		if response.ContentLength > s.maxBodyBytes {
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+			writeError(http.StatusBadGateway, "UPSTREAM_PROTOCOL_ERROR", "target response body exceeds limit", false)
+			return
+		}
+		if response.Body != nil {
+			readLimit := s.maxBodyBytes + 1
+			if s.maxBodyBytes == math.MaxInt64 {
+				readLimit = math.MaxInt64
+			}
+			body := response.Body
+			response.Body = struct {
+				io.Reader
+				io.Closer
+			}{Reader: io.LimitReader(body, readLimit), Closer: body}
+		}
+		responseBody, err = response.ToBytes()
+	}
 	if err != nil {
+		if response != nil && response.Response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
 		code, retryable := classifyUpstreamError(err)
 		message := map[string]string{
 			"UPSTREAM_TIMEOUT":        "target request timed out",
@@ -367,7 +429,7 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(httpStatus, code, message, retryable)
 		return
 	}
-	if int64(len(response.Bytes())) > s.maxBodyBytes {
+	if int64(len(responseBody)) > s.maxBodyBytes {
 		writeError(http.StatusBadGateway, "UPSTREAM_PROTOCOL_ERROR", "target response body exceeds limit", false)
 		return
 	}
@@ -416,7 +478,7 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 		StatusCode:      response.StatusCode,
 		ReasonPhrase:    reasonPhrase,
 		Headers:         responseHeaders,
-		BodyBase64:      base64.StdEncoding.EncodeToString(response.Bytes()),
+		BodyBase64:      base64.StdEncoding.EncodeToString(responseBody),
 		URL:             responseURL,
 		HTTPVersion:     response.Proto,
 		ElapsedMS:       float64(response.TotalTime()) / float64(time.Millisecond),
