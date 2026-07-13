@@ -2,12 +2,17 @@ import asyncio
 import base64
 import json
 import os
+import socket
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
 
@@ -1492,6 +1497,342 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("/api/v1/clients/client-2/requests", [call["path"] for call in self.state.calls])
         self.assertEqual([call["path"] for call in self.state.calls].count("/api/v1/clients/client-2"), 1)
+
+
+class LoopbackTarget:
+    def __init__(self):
+        self.calls = []
+        self.lock = threading.Lock()
+
+
+class LoopbackTargetHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def handle(self):
+        try:
+            super().handle()
+        except ConnectionError:
+            pass
+
+    def log_message(self, _format, *_args):
+        pass
+
+    def _send(self, status=200, body=b"", headers=(), reason=None):
+        self.send_response(status, reason)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except ConnectionError:
+                pass
+
+    def _json(self, payload, status=200, headers=()):
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        self._send(status, body, (("Content-Type", "application/json"), *headers))
+
+    def _handle(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(size)
+        parsed = urlsplit(self.path)
+        call = {
+            "method": self.command,
+            "path": parsed.path,
+            "query": parse_qs(parsed.query, keep_blank_values=True),
+            "headers": list(self.headers.raw_items()),
+            "body": body,
+        }
+        with self.server.state.lock:
+            self.server.state.calls.append(call)
+
+        if parsed.path == "/raw":
+            self._send(200, body, (("Content-Type", self.headers.get("Content-Type", "application/octet-stream")),))
+        elif parsed.path == "/binary":
+            self._send(
+                201,
+                b"\x00\xffresponse",
+                (("Content-Type", "application/octet-stream"), ("X-Dupe", "a"), ("X-Dupe", "b")),
+                "Created",
+            )
+        elif parsed.path == "/redirect":
+            self._send(302, headers=(("Location", "/final"), ("Set-Cookie", "hop=one; Path=/")))
+        elif parsed.path == "/final":
+            self._json({"final": True})
+        elif parsed.path == "/cookie":
+            self._send(204, headers=(("Set-Cookie", "server=one; Path=/"),))
+        elif parsed.path == "/duplicate-header":
+            self._send(204, headers=(("X-Dupe", "a"), ("X-Dupe", "b")))
+        elif parsed.path.startswith("/status/"):
+            self._send(int(parsed.path.rsplit("/", 1)[1]), b"status")
+        elif parsed.path == "/sleep":
+            time.sleep(float(call["query"].get("seconds", ["0"])[0]))
+            self._send(204)
+        elif parsed.path == "/basic":
+            expected = "Basic " + base64.b64encode(b"user:pass").decode()
+            if self.headers.get("Authorization") != expected:
+                self._send(401, headers=(("WWW-Authenticate", 'Basic realm="loopback"'),))
+            else:
+                self._json({"authenticated": True})
+        elif parsed.path == "/digest":
+            authorization = self.headers.get("Authorization", "")
+            scheme, _, raw_fields = authorization.partition(" ")
+            fields = parse_keqv_list(parse_http_list(raw_fields)) if raw_fields else {}
+            required = {"username", "realm", "nonce", "uri", "response", "qop", "nc", "cnonce"}
+            if scheme != "Digest" or not required.issubset(fields):
+                self._send(
+                    401,
+                    headers=(("WWW-Authenticate", 'Digest realm="loopback", nonce="fixed-nonce", algorithm=MD5, qop="auth"'),),
+                )
+            else:
+                self._json({"scheme": scheme, "fields": sorted(fields)})
+        else:
+            self._json(
+                {
+                    "method": self.command,
+                    "query": call["query"],
+                    "content_type": self.headers.get("Content-Type", ""),
+                    "body_base64": base64.b64encode(body).decode(),
+                }
+            )
+
+    do_GET = _handle
+    do_POST = _handle
+    do_PUT = _handle
+    do_PATCH = _handle
+    do_DELETE = _handle
+    do_HEAD = _handle
+    do_OPTIONS = _handle
+    do_PURGE = _handle
+
+
+class GoHTTPXE2ETests(unittest.TestCase):
+    token = "e2e-fixed-token"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.exe_path = Path(tempfile.gettempdir()) / f"gohttpx-test-{os.getpid()}.exe"
+        cls.go_process = None
+        cls.target_server = None
+        cls.target_thread = None
+        if cls.exe_path.exists():
+            raise RuntimeError(f"临时 EXE 已存在，拒绝覆盖: {cls.exe_path}")
+        module_dir = Path(__file__).resolve().parents[1]
+        built = subprocess.run(
+            ["go", "build", "-o", str(cls.exe_path), "."],
+            cwd=module_dir,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+        )
+        if built.returncode:
+            if cls.exe_path.exists():
+                cls.exe_path.unlink()
+            raise RuntimeError(f"go build 失败 ({built.returncode}):\n{built.stdout}{built.stderr}")
+        try:
+            cls.target_state = LoopbackTarget()
+            cls.target_server = ThreadingHTTPServer(("127.0.0.1", 0), LoopbackTargetHandler)
+            cls.target_server.state = cls.target_state
+            cls.target_thread = threading.Thread(target=cls.target_server.serve_forever, daemon=True)
+            cls.target_thread.start()
+            host, port = cls.target_server.server_address
+            cls.target_endpoint = f"http://{host}:{port}"
+
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                go_port = probe.getsockname()[1]
+            cls.go_endpoint = f"http://127.0.0.1:{go_port}"
+            cls.go_process = subprocess.Popen(
+                [str(cls.exe_path), "--host", "127.0.0.1", "--port", str(go_port), "--token", cls.token],
+                cwd=module_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if cls.go_process.poll() is not None:
+                    raise RuntimeError(f"Go 服务提前退出，exit code={cls.go_process.returncode}")
+                try:
+                    response = httpx.get(cls.go_endpoint + "/api/v1/health", timeout=0.2, trust_env=False)
+                    if response.status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                time.sleep(0.05)
+            else:
+                raise RuntimeError(f"Go 服务 health 超时，exit code={cls.go_process.poll()}")
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.target_server is not None:
+            cls.target_server.shutdown()
+            cls.target_server.server_close()
+        if cls.target_thread is not None:
+            cls.target_thread.join(5)
+        if cls.go_process is not None and cls.go_process.poll() is None:
+            cls.go_process.terminate()
+            try:
+                cls.go_process.wait(5)
+            except subprocess.TimeoutExpired:
+                cls.go_process.kill()
+                cls.go_process.wait(5)
+        if cls.exe_path.exists():
+            cls.exe_path.unlink()
+        if cls.exe_path.exists():
+            raise AssertionError(f"临时 EXE 清理失败: {cls.exe_path}")
+
+    def setUp(self):
+        with self.target_state.lock:
+            self.target_state.calls.clear()
+
+    def test_body_modes_reach_target_as_httpx_encoded_bytes(self):
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:
+            json_response = client.post(self.target_endpoint + "/echo", json={"a": 1}).json()
+            form_response = client.post(self.target_endpoint + "/echo", data={"a": "1"}).json()
+            upload_response = client.post(
+                self.target_endpoint + "/echo",
+                files={"file": ("a.bin", b"file-bytes", "application/octet-stream")},
+            ).json()
+            raw_response = client.post(self.target_endpoint + "/raw", content=b"\x00\xff")
+
+        self.assertEqual(base64.b64decode(json_response["body_base64"]), b'{"a":1}')
+        self.assertEqual(json_response["content_type"], "application/json")
+        self.assertEqual(base64.b64decode(form_response["body_base64"]), b"a=1")
+        self.assertEqual(form_response["content_type"], "application/x-www-form-urlencoded")
+        upload = base64.b64decode(upload_response["body_base64"])
+        self.assertIn(b'filename="a.bin"', upload)
+        self.assertIn(b"file-bytes", upload)
+        self.assertTrue(upload_response["content_type"].startswith("multipart/form-data; boundary="))
+        self.assertEqual(raw_response.content, b"\x00\xff")
+        self.assertEqual(raw_response.headers["content-type"], "application/octet-stream")
+
+    def test_all_methods_share_the_real_request_route(self):
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:
+            for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "PURGE"):
+                with self.subTest(method=method):
+                    response = client.request(method, self.target_endpoint + "/method")
+                    self.assertEqual(response.status_code, 200)
+        with self.target_state.lock:
+            self.assertEqual([call["method"] for call in self.target_state.calls], ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "PURGE"])
+
+    def test_query_headers_cookies_and_duplicate_response_headers(self):
+        with Client(
+            go_endpoint=self.go_endpoint,
+            go_token=self.token,
+            headers={"X-Default": "one"},
+            cookies={"initial": "yes"},
+        ) as client:
+            query = client.get(self.target_endpoint + "/echo", params=[("a", "1"), ("a", "2")]).json()
+            client.get(self.target_endpoint + "/cookie")
+            client.headers["X-Default"] = "two"
+            client.cookies.set("python", "updated")
+            client.get(self.target_endpoint + "/echo")
+            duplicate = client.get(self.target_endpoint + "/duplicate-header")
+
+        self.assertEqual(query["query"], {"a": ["1", "2"]})
+        with self.target_state.lock:
+            updated = self.target_state.calls[2]
+        headers = dict(updated["headers"])
+        self.assertEqual(headers["X-Default"], "two")
+        self.assertIn("initial=yes", headers["Cookie"])
+        self.assertIn("server=one", headers["Cookie"])
+        self.assertIn("python=updated", headers["Cookie"])
+        self.assertEqual(duplicate.headers.get_list("x-dupe"), ["a", "b"])
+
+    def test_redirect_and_target_error_statuses_are_httpx_responses(self):
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token, follow_redirects=True) as client:
+            redirected = client.get(self.target_endpoint + "/redirect")
+            not_found = client.get(self.target_endpoint + "/status/404")
+            failed = client.get(self.target_endpoint + "/status/500")
+        self.assertEqual(redirected.json(), {"final": True})
+        self.assertEqual([response.status_code for response in redirected.history], [302])
+        self.assertEqual((not_found.status_code, failed.status_code), (404, 500))
+
+    def test_basic_and_digest_auth_follow_real_challenges(self):
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token, auth=httpx.BasicAuth("user", "pass")) as client:
+            self.assertTrue(client.get(self.target_endpoint + "/basic").json()["authenticated"])
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token, auth=httpx.DigestAuth("user", "pass")) as client:
+            digest = client.get(self.target_endpoint + "/digest")
+        self.assertEqual(digest.json()["scheme"], "Digest")
+        self.assertTrue({"username", "realm", "nonce", "uri", "response", "qop", "nc", "cnonce"}.issubset(digest.json()["fields"]))
+
+    def test_binary_request_and_response_metadata(self):
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:
+            response = client.post(self.target_endpoint + "/binary", content=b"\x00\xffrequest")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.content, b"\x00\xffresponse")
+        self.assertEqual(response.reason_phrase, "Created")
+        self.assertEqual(response.headers.get_list("x-dupe"), ["a", "b"])
+        self.assertEqual(response.http_version, "HTTP/1.1")
+        with self.target_state.lock:
+            self.assertEqual(self.target_state.calls[0]["body"], b"\x00\xffrequest")
+
+    def test_real_upstream_timeout_maps_to_httpx_timeout(self):
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:
+            request_url = self.target_endpoint + "/sleep?seconds=0.2"
+            with self.assertRaises(httpx.TimeoutException) as caught:
+                client.get(request_url, timeout=0.02)
+        self.assertEqual(caught.exception.code, "UPSTREAM_TIMEOUT")
+        self.assertEqual(caught.exception.request.url, httpx.URL(request_url))
+
+    def test_client_sessions_state_and_close_are_isolated(self):
+        first = Client(go_endpoint=self.go_endpoint, go_token=self.token, headers={"X-Client": "first"}, cookies={"owner": "first"})
+        second = Client(go_endpoint=self.go_endpoint, go_token=self.token, headers={"X-Client": "second"}, cookies={"owner": "second"})
+        try:
+            self.assertNotEqual(first._transport._client_id, second._transport._client_id)
+            first.get(self.target_endpoint + "/echo")
+            second.get(self.target_endpoint + "/echo")
+            first.close()
+            self.assertEqual(second.get(self.target_endpoint + "/echo").status_code, 200)
+        finally:
+            first.close()
+            second.close()
+        with self.target_state.lock:
+            headers = [dict(call["headers"]) for call in self.target_state.calls]
+        self.assertEqual([item["X-Client"] for item in headers], ["first", "second", "second"])
+        self.assertIn("owner=first", headers[0]["Cookie"])
+        self.assertTrue(all("owner=second" in item["Cookie"] for item in headers[1:]))
+
+    def test_deleted_session_rebuilds_once_and_post_reaches_target_once(self):
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:
+            old_client_id = client._transport._client_id
+            deleted = httpx.delete(
+                self.go_endpoint + f"/api/v1/clients/{old_client_id}",
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=1,
+                trust_env=False,
+            )
+            self.assertEqual(deleted.status_code, 204)
+            response = client.post(self.target_endpoint + "/once", content=b"\x00\xffonce")
+            self.assertNotEqual(client._transport._client_id, old_client_id)
+        self.assertEqual(response.status_code, 200)
+        with self.target_state.lock:
+            calls = [call for call in self.target_state.calls if call["path"] == "/once"]
+        self.assertEqual([call["body"] for call in calls], [b"\x00\xffonce"])
+
+    def test_token_never_reaches_target_and_wrong_token_cannot_create(self):
+        with self.assertRaises(GoProtocolError) as caught:
+            Client(go_endpoint=self.go_endpoint, go_token="wrong-token")
+        self.assertEqual(caught.exception.code, "UNAUTHORIZED")
+        with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:
+            client.post(self.target_endpoint + "/echo", content=b"safe")
+        with self.target_state.lock:
+            target_bytes = repr(self.target_state.calls).encode()
+        self.assertNotIn(self.token.encode(), target_bytes)
+
+    def test_async_client_uses_the_same_real_go_service(self):
+        async def request():
+            async with AsyncClient(go_endpoint=self.go_endpoint, go_token=self.token) as client:
+                return await client.post(self.target_endpoint + "/async", json={"async": True})
+
+        response = asyncio.run(request())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(base64.b64decode(response.json()["body_base64"]), b'{"async":true}')
 
 
 if __name__ == "__main__":
