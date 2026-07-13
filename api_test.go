@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -140,6 +142,100 @@ func TestClientLifecycleRejectsUnsupportedFingerprint(t *testing.T) {
 	}
 	if apiErr.Error.Code != "UNSUPPORTED_FEATURE" {
 		t.Fatalf("error = %#v", apiErr)
+	}
+}
+
+func TestClientLifecycleRejectsNonConfigurationJSON(t *testing.T) {
+	tests := map[string]string{
+		"headers":  `{"protocol_version":1,"headers":{"X-Test":"value"}}`,
+		"cookies":  `{"protocol_version":1,"cookies":{"session":"secret"}}`,
+		"trailing": `{"protocol_version":1} {}`,
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			s := newServer("", 48<<20, time.Hour)
+			response := httptest.NewRecorder()
+			s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(body)))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			var apiErr errorResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &apiErr); err != nil {
+				t.Fatal(err)
+			}
+			if apiErr.Error.Code != "INVALID_REQUEST" {
+				t.Fatalf("error = %#v", apiErr)
+			}
+		})
+	}
+}
+
+func TestBuildReqClientPreservesRawHTTPBehavior(t *testing.T) {
+	var compressed bytes.Buffer
+	gzipWriter := gzip.NewWriter(&compressed)
+	if _, err := gzipWriter.Write([]byte("compressed body")); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	acceptEncoding := make(chan string, 1)
+	redirected := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/compressed":
+			acceptEncoding <- r.Header.Get("Accept-Encoding")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("X-Raw", "preserved")
+			_, _ = w.Write(compressed.Bytes())
+		case "/charset":
+			w.Header().Set("Content-Type", "text/plain; charset=iso-8859-1")
+			_, _ = w.Write([]byte{0xe9})
+		case "/redirect":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/final":
+			redirected <- struct{}{}
+		}
+	}))
+	defer target.Close()
+
+	client, err := buildReqClient(createClientRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressedResponse, err := client.R().Get(target.URL + "/compressed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := <-acceptEncoding; got != "" {
+		t.Fatalf("Accept-Encoding = %q", got)
+	}
+	if compressedResponse.Header.Get("Content-Encoding") != "gzip" || compressedResponse.Header.Get("X-Raw") != "preserved" {
+		t.Fatalf("response headers = %#v", compressedResponse.Header)
+	}
+	if !bytes.Equal(compressedResponse.Bytes(), compressed.Bytes()) {
+		t.Fatalf("compressed body = %x", compressedResponse.Bytes())
+	}
+
+	charsetResponse, err := client.R().Get(target.URL + "/charset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(charsetResponse.Bytes(), []byte{0xe9}) {
+		t.Fatalf("charset body = %x", charsetResponse.Bytes())
+	}
+
+	redirectResponse, err := client.R().Get(target.URL + "/redirect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redirectResponse.StatusCode != http.StatusFound {
+		t.Fatalf("redirect status = %d", redirectResponse.StatusCode)
+	}
+	select {
+	case <-redirected:
+		t.Fatal("client followed redirect")
+	default:
 	}
 }
 

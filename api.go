@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -170,7 +171,13 @@ func (s *server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 
 func (s *server) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 	var input createClientRequest
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "INVALID_REQUEST", Message: "invalid client configuration"}})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "INVALID_REQUEST", Message: "invalid client configuration"}})
 		return
 	}
@@ -223,6 +230,7 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 		return nil, fmt.Errorf("unsupported TLS fingerprint %q", fingerprint)
 	}
 	client := req.C().
+		DisableCompression().
 		DisableAutoDecompress().
 		DisableAutoDecode()
 	client.GetClient().Jar = nil
