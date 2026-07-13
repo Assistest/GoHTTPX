@@ -696,6 +696,8 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
         self._control: httpx.AsyncClient | None = None
         self._condition = asyncio.Condition()
         self._session_lock = asyncio.Lock()
+        self._session_attempt: asyncio.Task[str] | None = None
+        self._session_attempt_waiters = 0
         self._active = 0
         self._closing = False
         self._closed = False
@@ -769,16 +771,34 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
             raise
 
     async def _ensure_session(self, request: httpx.Request) -> tuple[str, int]:
-        if self._client_id is not None:
-            return self._client_id, self._generation
         async with self._session_lock:
             if self._client_id is not None:
                 return self._client_id, self._generation
             async with self._condition:
                 if self._closing or self._closed:
                     raise GoServiceUnavailable("Go transport 已关闭", request=request)
-            client_id = await self._create_session(request)
-            self._client_id = client_id
+            if self._session_attempt is None:
+                self._session_attempt = asyncio.create_task(self._create_session(request))
+            attempt = self._session_attempt
+            self._session_attempt_waiters += 1
+
+        try:
+            client_id = await asyncio.shield(attempt)
+        except BaseException as exc:
+            async with self._session_lock:
+                self._session_attempt_waiters -= 1
+                if attempt.done() and not self._session_attempt_waiters:
+                    self._session_attempt = None
+            if isinstance(exc, Exception):
+                raise _retarget_transport_error(exc, request) from exc
+            raise
+
+        async with self._session_lock:
+            if self._client_id is None:
+                self._client_id = client_id
+            self._session_attempt_waiters -= 1
+            if not self._session_attempt_waiters:
+                self._session_attempt = None
             return client_id, self._generation
 
     async def _rebuild(self, generation: int, request: httpx.Request) -> str:
@@ -993,12 +1013,17 @@ class Client(httpx.Client):
                 transport=go_transport,
                 default_encoding=default_encoding,
             )
+            self._close_lock = threading.Lock()
         except BaseException:
             try:
                 go_transport.close()
             except BaseException:
                 pass
             raise
+
+    def close(self) -> None:
+        with self._close_lock:
+            super().close()
 
 
 class AsyncClient(httpx.AsyncClient):
@@ -1060,6 +1085,15 @@ class AsyncClient(httpx.AsyncClient):
             transport=go_transport,
             default_encoding=default_encoding,
         )
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+
+    async def aclose(self) -> None:
+        async with self._close_lock:
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(super().aclose())
+            close_task = self._close_task
+        await asyncio.shield(close_task)
 
 
 __all__ = [

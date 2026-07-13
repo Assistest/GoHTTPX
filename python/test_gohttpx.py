@@ -102,6 +102,7 @@ class FakeGo:
         self.create_started = threading.Event()
         self.release_create = threading.Event()
         self.block_requests = False
+        self.block_create = False
         self.block_rebuild_create = False
         self.block_delete = False
 
@@ -179,7 +180,7 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 self.state.create_count += 1
                 create_count = self.state.create_count
-            if self.state.block_rebuild_create and create_count > 1:
+            if self.state.block_create or (self.state.block_rebuild_create and create_count > 1):
                 self.state.create_started.set()
                 self.state.release_create.wait(2)
             if self.state.enforce_http3_create and payload.get("http_version") == "http3":
@@ -1016,6 +1017,36 @@ class ClientTests(unittest.TestCase):
         self.assertLess(paths.index("/api/v1/clients/client-1/requests"), paths.index("/api/v1/clients/client-1"))
         self.assertEqual(paths.count("/api/v1/clients/client-1"), 1)
 
+    def test_concurrent_public_close_calls_both_wait_for_transport_cleanup(self):
+        self.state.block_requests = True
+        client = Client(go_endpoint=self.endpoint)
+        request_thread = threading.Thread(
+            target=lambda: client.get("https://target.test/a"),
+            daemon=True,
+        )
+        request_thread.start()
+        self.assertTrue(self.state.request_started.wait(1))
+        finished = [threading.Event(), threading.Event()]
+
+        def close(index):
+            client.close()
+            finished[index].set()
+
+        first = threading.Thread(target=close, args=(0,), daemon=True)
+        second = threading.Thread(target=close, args=(1,), daemon=True)
+        first.start()
+        time.sleep(0.05)
+        second.start()
+        time.sleep(0.05)
+
+        self.assertFalse(finished[0].is_set())
+        self.assertFalse(finished[1].is_set())
+        self.state.release_request.set()
+        request_thread.join(1)
+        first.join(1)
+        second.join(1)
+        self.assertTrue(all(event.is_set() for event in finished))
+
     def test_request_control_timeout_is_target_timeout_plus_bounded_grace(self):
         self.state.block_requests = True
         client = Client(go_endpoint=self.endpoint)
@@ -1118,6 +1149,39 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.create_count, 1)
         self.assertEqual(sum(call["path"] == "/api/v1/capabilities" for call in self.state.calls), 1)
 
+    async def test_async_concurrent_first_failure_shares_attempt_then_later_request_retries(self):
+        self.state.block_create = True
+        self.state.create_response = (
+            500,
+            b'{"error":{"code":"INTERNAL_ERROR","message":"create failed","retryable":false}}',
+            "application/json",
+        )
+        client = AsyncClient(go_endpoint=self.endpoint)
+        tasks = [
+            asyncio.create_task(client.get(f"https://target.test/{index}"))
+            for index in range(4)
+        ]
+        self.assertTrue(await asyncio.to_thread(self.state.create_started.wait, 1))
+        await asyncio.sleep(0.05)
+        self.state.release_create.set()
+        errors = await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.assertTrue(all(isinstance(error, GoProtocolError) for error in errors))
+        self.assertEqual(
+            {error.request.url for error in errors},
+            {httpx.URL(f"https://target.test/{index}") for index in range(4)},
+        )
+        self.assertEqual(sum(call["path"] == "/api/v1/capabilities" for call in self.state.calls), 1)
+        self.assertEqual(sum(call["path"] == "/api/v1/clients" for call in self.state.calls), 1)
+
+        self.state.block_create = False
+        self.state.create_response = None
+        response = await client.get("https://target.test/retry")
+        await client.aclose()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.state.create_count, 2)
+
     async def test_async_concurrent_client_not_found_rebuild_is_single_flight(self):
         client = AsyncClient(go_endpoint=self.endpoint)
         await client.get("https://target.test/warm")
@@ -1160,6 +1224,58 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         paths = [call["path"] for call in self.state.calls]
         self.assertLess(paths.index("/api/v1/clients/client-1/requests"), paths.index("/api/v1/clients/client-1"))
+
+    async def test_concurrent_public_aclose_calls_both_wait_for_transport_cleanup(self):
+        self.state.block_requests = True
+        client = AsyncClient(go_endpoint=self.endpoint)
+        request_task = asyncio.create_task(client.get("https://target.test/slow"))
+        self.assertTrue(await asyncio.to_thread(self.state.request_started.wait, 1))
+        first = asyncio.create_task(client.aclose())
+        second = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0.05)
+
+        self.assertFalse(first.done())
+        self.assertFalse(second.done())
+        self.state.release_request.set()
+        await request_task
+        await asyncio.gather(first, second)
+        self.assertEqual([call["path"] for call in self.state.calls].count("/api/v1/clients/client-1"), 1)
+
+    async def test_cancelling_one_aclose_waiter_does_not_cancel_shared_cleanup(self):
+        self.state.block_requests = True
+        client = AsyncClient(go_endpoint=self.endpoint)
+        request_task = asyncio.create_task(client.get("https://target.test/slow"))
+        self.assertTrue(await asyncio.to_thread(self.state.request_started.wait, 1))
+        cancelled = asyncio.create_task(client.aclose())
+        survivor = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0.05)
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        self.assertFalse(survivor.done())
+
+        self.state.release_request.set()
+        await request_task
+        await survivor
+        self.assertEqual([call["path"] for call in self.state.calls].count("/api/v1/clients/client-1"), 1)
+
+    async def test_concurrent_aclose_waiters_share_cleanup_error(self):
+        client = AsyncClient(go_endpoint=self.endpoint)
+        await client.get("https://target.test/warm")
+        self.state.delete_response = (
+            500,
+            b'{"error":{"code":"INTERNAL_ERROR","message":"delete failed","retryable":false}}',
+            "application/json",
+        )
+
+        errors = await asyncio.gather(client.aclose(), client.aclose(), return_exceptions=True)
+
+        self.assertTrue(all(isinstance(error, GoProtocolError) for error in errors))
+        self.assertTrue(all(error.code == "INTERNAL_ERROR" for error in errors))
+        with self.assertRaises(GoProtocolError) as repeated:
+            await client.aclose()
+        self.assertEqual(repeated.exception.code, "INTERNAL_ERROR")
+        self.assertEqual([call["path"] for call in self.state.calls].count("/api/v1/clients/client-1"), 1)
 
     async def test_async_error_mapping_and_strict_bad_envelopes_match_sync(self):
         client = AsyncClient(go_endpoint=self.endpoint)
