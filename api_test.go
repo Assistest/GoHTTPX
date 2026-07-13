@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -13,6 +14,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math"
 	"math/big"
@@ -1182,6 +1184,85 @@ func TestClientOptionsHTTP3MapsOnlyEquivalentConfiguration(t *testing.T) {
 	}
 }
 
+func createHTTP3Session(t *testing.T, s *server) (string, *http3.Transport) {
+	t.Helper()
+	created := httptest.NewRecorder()
+	s.routes().ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3"}`)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var result createClientResponse
+	if err := json.Unmarshal(created.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.RLock()
+	session := s.clients[result.ClientID]
+	s.mu.RUnlock()
+	transport, ok := session.client.GetClient().Transport.(*http3.Transport)
+	if !ok {
+		t.Fatalf("transport = %T", session.client.GetClient().Transport)
+	}
+	return result.ClientID, transport
+}
+
+func assertHTTP3TransportClosed(t *testing.T, transport *http3.Transport) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = transport.RoundTrip(request); !errors.Is(err, http3.ErrTransportClosed) {
+		t.Fatalf("RoundTrip error after close = %v", err)
+	}
+}
+
+func TestDeleteClientClosesHTTP3Transport(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	for range 3 {
+		clientID, transport := createHTTP3Session(t, s)
+		deleted := httptest.NewRecorder()
+		s.routes().ServeHTTP(deleted, httptest.NewRequest(http.MethodDelete, "/api/v1/clients/"+clientID, nil))
+		if deleted.Code != http.StatusNoContent {
+			t.Fatalf("delete status=%d body=%s", deleted.Code, deleted.Body.String())
+		}
+		assertHTTP3TransportClosed(t, transport)
+	}
+}
+
+func TestIdleCleanupClosesHTTP3Transport(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	clientID, transport := createHTTP3Session(t, s)
+	s.clients[clientID].mu.Lock()
+	s.clients[clientID].lastUsed = time.Now().Add(-2 * time.Hour)
+	s.clients[clientID].mu.Unlock()
+
+	s.cleanupIdleClients(time.Now())
+
+	assertHTTP3TransportClosed(t, transport)
+}
+
+func TestServerCloseClosesAllHTTP3Transports(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	_, first := createHTTP3Session(t, s)
+	_, second := createHTTP3Session(t, s)
+	normalClient, err := buildReqClient(createClientRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.clients["http1"] = &clientSession{client: normalClient, lastUsed: time.Now()}
+
+	s.Close()
+	s.Close()
+
+	assertHTTP3TransportClosed(t, first)
+	assertHTTP3TransportClosed(t, second)
+	if len(s.clients) != 0 {
+		t.Fatalf("remaining sessions = %d", len(s.clients))
+	}
+}
+
 func TestHTTP3RejectsConnectionSpecificRequestOptions(t *testing.T) {
 	client, err := buildReqClient(createClientRequest{HTTPVersion: "http3"})
 	if err != nil {
@@ -1329,6 +1410,41 @@ func TestClientOptionsRetryModesAndStatusCodes(t *testing.T) {
 	}
 }
 
+func TestClientOptionsRejectIgnoredRetryFields(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		field string
+		retry retryConfig
+	}{
+		{name: "none fixed interval", field: "fixed_interval_ms", retry: retryConfig{FixedIntervalMS: 1}},
+		{name: "none backoff minimum", field: "backoff_min_ms", retry: retryConfig{BackoffMinMS: 1}},
+		{name: "none backoff maximum", field: "backoff_max_ms", retry: retryConfig{BackoffMaxMS: 1}},
+		{name: "none status codes", field: "status_codes", retry: retryConfig{StatusCodes: []int{503}}},
+		{name: "none count", field: "count", retry: retryConfig{Count: 1, Mode: retryNone}},
+		{name: "zero count fixed mode", field: "mode", retry: retryConfig{Mode: retryFixed}},
+		{name: "zero count backoff mode", field: "mode", retry: retryConfig{Mode: retryBackoff}},
+		{name: "fixed backoff minimum", field: "backoff_min_ms", retry: retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, BackoffMinMS: 1}},
+		{name: "fixed backoff maximum", field: "backoff_max_ms", retry: retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, BackoffMaxMS: 1}},
+		{name: "backoff fixed interval", field: "fixed_interval_ms", retry: retryConfig{Count: 1, Mode: retryBackoff, FixedIntervalMS: 1, BackoffMinMS: 1, BackoffMaxMS: 2}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := buildReqClient(createClientRequest{Retry: test.retry})
+			if err == nil || !strings.Contains(err.Error(), "retry."+test.field) {
+				t.Fatalf("error = %v, want retry.%s", err, test.field)
+			}
+		})
+	}
+}
+
+func TestCreateClientRejectsIgnoredRetryField(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	response := httptest.NewRecorder()
+	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"retry":{"count":1,"mode":"fixed","fixed_interval_ms":1,"backoff_min_ms":1}}`)))
+	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "retry.backoff_min_ms") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestClientOptionsStrictNestedJSONAndInvalidConfigurationCode(t *testing.T) {
 	for _, body := range []string{
 		`{"protocol_version":1,"retry":{"unknown":1}}`,
@@ -1400,7 +1516,7 @@ func TestRequestOptionsValidateRetryOverride(t *testing.T) {
 			URL:             "http://example.com",
 			Options:         requestOptions{RetryCount: &count},
 		})
-		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
+		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "retry_count") {
 			t.Fatalf("count=%d status=%d body=%s", count, response.Code, response.Body.String())
 		}
 	}

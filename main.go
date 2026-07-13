@@ -43,9 +43,10 @@ func main() {
 		log.Fatal("必须通过 GOHTTPX_TOKEN 或 --token 配置 token，开发环境可显式传入 --insecure-no-auth")
 	}
 
+	registry := newServer(*token, *maxBodyMiB<<20, *idleTTL)
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(*host, strconv.Itoa(*port)),
-		Handler:           newServer(*token, *maxBodyMiB<<20, *idleTTL).routes(),
+		Handler:           registry.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -53,9 +54,11 @@ func main() {
 	}
 
 	interrupt := make(chan os.Signal, 1)
+	shutdownDone := make(chan struct{})
 	signal.Notify(interrupt, os.Interrupt)
 	defer signal.Stop(interrupt)
 	go func() {
+		defer close(shutdownDone)
 		<-interrupt
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -65,7 +68,12 @@ func main() {
 	}()
 
 	log.Printf("GoHTTPX 监听 %s", httpServer.Addr)
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	err := httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		<-shutdownDone
+	}
+	registry.Close()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }

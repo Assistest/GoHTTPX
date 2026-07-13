@@ -184,9 +184,18 @@ type http2Config struct {
 type clientSession struct {
 	client      *req.Client
 	config      createClientRequest
+	closer      io.Closer
 	lastUsed    time.Time
 	activeCalls int
 	mu          sync.Mutex
+}
+
+func (s *clientSession) close() {
+	if s.closer != nil {
+		_ = s.closer.Close()
+		return
+	}
+	s.client.GetClient().CloseIdleConnections()
 }
 
 type createClientResponse struct {
@@ -373,6 +382,8 @@ type server struct {
 	maxBodyBytes int64
 	idleTTL      time.Duration
 	clients      map[string]*clientSession
+	done         chan struct{}
+	closeOnce    sync.Once
 	mu           sync.RWMutex
 }
 
@@ -382,9 +393,23 @@ func newServer(token string, maxBodyBytes int64, idleTTL time.Duration) *server 
 		maxBodyBytes: maxBodyBytes,
 		idleTTL:      idleTTL,
 		clients:      make(map[string]*clientSession),
+		done:         make(chan struct{}),
 	}
 	go s.cleanupLoop()
 	return s
+}
+
+func (s *server) Close() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+		s.mu.Lock()
+		clients := s.clients
+		s.clients = make(map[string]*clientSession)
+		s.mu.Unlock()
+		for _, session := range clients {
+			session.close()
+		}
+	})
 }
 
 func (s *server) routes() http.Handler {
@@ -473,14 +498,20 @@ func (s *server) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: code, Message: err.Error()}})
 		return
 	}
+	session := &clientSession{client: client, config: input}
+	if transport, ok := client.GetClient().Transport.(*quichttp3.Transport); ok {
+		session.closer = transport
+	}
 	clientID, err := newClientID()
 	if err != nil {
+		session.close()
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: apiError{Code: "INTERNAL_ERROR", Message: "failed to create client session"}})
 		return
 	}
 	now := time.Now()
+	session.lastUsed = now
 	s.mu.Lock()
-	s.clients[clientID] = &clientSession{client: client, config: input, lastUsed: now}
+	s.clients[clientID] = session
 	s.mu.Unlock()
 	writeJSON(w, http.StatusCreated, createClientResponse{
 		ProtocolVersion: protocolVersion,
@@ -495,7 +526,7 @@ func (s *server) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 	delete(s.clients, r.PathValue("clientID"))
 	s.mu.Unlock()
 	if session != nil {
-		session.client.GetClient().CloseIdleConnections()
+		session.close()
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -790,7 +821,7 @@ func decodeRequestEnvelope(w http.ResponseWriter, r *http.Request, maxBodyBytes 
 		return input, nil, nil, &apiError{Code: "INVALID_REQUEST", Message: "invalid request timeout"}
 	}
 	if input.Options.RetryCount != nil && (*input.Options.RetryCount < 0 || *input.Options.RetryCount > 10) {
-		return input, nil, nil, &apiError{Code: "INVALID_REQUEST", Message: "invalid request retry count"}
+		return input, nil, nil, &apiError{Code: "INVALID_REQUEST", Message: "retry_count must be between 0 and 10"}
 	}
 	return input, headers, body, nil
 }
@@ -1339,36 +1370,69 @@ func validateRetryConfig(input retryConfig) error {
 		mode = retryNone
 	}
 	if input.Count < 0 || input.Count > 10 {
-		return errors.New("retry count must be between 0 and 10")
+		return errors.New("retry.count must be between 0 and 10")
 	}
-	if input.Count == 0 && mode != retryNone || input.Count > 0 && mode == retryNone {
-		return errors.New("retry mode does not match retry count")
+	if mode != retryNone && mode != retryFixed && mode != retryBackoff {
+		return fmt.Errorf("invalid retry.mode %q", input.Mode)
 	}
-	for _, value := range []int64{input.FixedIntervalMS, input.BackoffMinMS, input.BackoffMaxMS} {
-		if value < 0 || value > 600000 {
-			return errors.New("retry interval must be between 0 and 600000 milliseconds")
+	for _, interval := range []struct {
+		field string
+		value int64
+	}{
+		{field: "fixed_interval_ms", value: input.FixedIntervalMS},
+		{field: "backoff_min_ms", value: input.BackoffMinMS},
+		{field: "backoff_max_ms", value: input.BackoffMaxMS},
+	} {
+		if interval.value < 0 || interval.value > 600000 {
+			return fmt.Errorf("retry.%s must be between 0 and 600000", interval.field)
 		}
+	}
+	if input.Count == 0 && mode != retryNone {
+		return errors.New("retry.mode must be none when retry.count is 0")
+	}
+	if input.Count > 0 && mode == retryNone {
+		return errors.New("retry.count requires retry.mode fixed or backoff")
 	}
 	switch mode {
 	case retryNone:
+		for _, option := range []struct {
+			field string
+			set   bool
+		}{
+			{field: "fixed_interval_ms", set: input.FixedIntervalMS != 0},
+			{field: "backoff_min_ms", set: input.BackoffMinMS != 0},
+			{field: "backoff_max_ms", set: input.BackoffMaxMS != 0},
+			{field: "status_codes", set: len(input.StatusCodes) > 0},
+		} {
+			if option.set {
+				return fmt.Errorf("retry.%s is unused when retry.mode is none", option.field)
+			}
+		}
 	case retryFixed:
+		if input.BackoffMinMS != 0 {
+			return errors.New("retry.backoff_min_ms is unused when retry.mode is fixed")
+		}
+		if input.BackoffMaxMS != 0 {
+			return errors.New("retry.backoff_max_ms is unused when retry.mode is fixed")
+		}
 		if input.FixedIntervalMS == 0 {
-			return errors.New("fixed retry interval must be positive")
+			return errors.New("retry.fixed_interval_ms must be positive when retry.mode is fixed")
 		}
 	case retryBackoff:
-		if input.BackoffMinMS == 0 || input.BackoffMinMS > input.BackoffMaxMS {
-			return errors.New("retry backoff must satisfy 0 < min <= max")
+		if input.FixedIntervalMS != 0 {
+			return errors.New("retry.fixed_interval_ms is unused when retry.mode is backoff")
 		}
-	default:
-		return fmt.Errorf("invalid retry mode %q", input.Mode)
+		if input.BackoffMinMS == 0 || input.BackoffMinMS > input.BackoffMaxMS {
+			return errors.New("retry.backoff_min_ms and retry.backoff_max_ms must satisfy 0 < min <= max")
+		}
 	}
 	seenStatusCodes := make(map[int]struct{}, len(input.StatusCodes))
 	for _, statusCode := range input.StatusCodes {
 		if statusCode < 100 || statusCode > 599 {
-			return errors.New("retry status code must be between 100 and 599")
+			return errors.New("retry.status_codes values must be between 100 and 599")
 		}
 		if _, ok := seenStatusCodes[statusCode]; ok {
-			return errors.New("duplicate retry status code")
+			return errors.New("retry.status_codes contains a duplicate value")
 		}
 		seenStatusCodes[statusCode] = struct{}{}
 	}
@@ -1386,8 +1450,13 @@ func newClientID() (string, error) {
 func (s *server) cleanupLoop() {
 	ticker := time.NewTicker(s.idleTTL)
 	defer ticker.Stop()
-	for now := range ticker.C {
-		s.cleanupIdleClients(now)
+	for {
+		select {
+		case now := <-ticker.C:
+			s.cleanupIdleClients(now)
+		case <-s.done:
+			return
+		}
 	}
 }
 
@@ -1405,7 +1474,7 @@ func (s *server) cleanupIdleClients(now time.Time) {
 	}
 	s.mu.Unlock()
 	for _, session := range expired {
-		session.client.GetClient().CloseIdleConnections()
+		session.close()
 	}
 }
 
