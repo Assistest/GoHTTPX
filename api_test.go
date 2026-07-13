@@ -897,6 +897,8 @@ func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
 	clientCAs := x509.NewCertPool()
 	clientCAs.AddCert(ca)
 	protocol := make(chan int, 4)
+	acceptEncoding := make(chan string, 1)
+	requestBodies := make(chan string, 2)
 	var retryCalls atomic.Int32
 	var handshakes atomic.Int32
 	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
@@ -906,7 +908,23 @@ func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
 	server := &http3.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			protocol <- r.ProtoMajor
-			if r.URL.Path == "/retry" && retryCalls.Add(1) == 1 {
+			switch r.URL.Path {
+			case "/body":
+				body, _ := io.ReadAll(r.Body)
+				requestBodies <- string(body)
+			case "/compression":
+				acceptEncoding <- r.Header.Get("Accept-Encoding")
+			case "/large-header":
+				w.Header().Set("X-Large", strings.Repeat("a", 1024))
+			case "/redirect":
+				http.Redirect(w, r, "/", http.StatusFound)
+				return
+			case "/slow":
+				time.Sleep(50 * time.Millisecond)
+			case "/retry":
+				if retryCalls.Add(1) != 1 {
+					break
+				}
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = w.Write([]byte("retry"))
 				return
@@ -984,6 +1002,48 @@ func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
 		t.Fatalf("calls=%d protocols=%d,%d trace=%#v dump=%q result=%#v", retryCalls.Load(), firstProtocol, secondProtocol, result.Trace, dump, result)
 	}
 	client.GetClient().CloseIdleConnections()
+
+	behaviorConfig := createClientRequest{HTTPVersion: "http3", RootCAPEM: caPEM, ClientCertPEM: clientCertificatePEM, ClientKeyPEM: clientKeyPEM, Compression: true}
+	behaviorClient, err := buildReqClient(behaviorConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressedResponse, err := behaviorClient.R().Get(targetURL + "/compression")
+	if err != nil || compressedResponse.StatusCode != http.StatusNoContent || <-protocol != 3 || <-acceptEncoding != "gzip" {
+		t.Fatalf("compression response=%v err=%v", compressedResponse, err)
+	}
+	bodyResponse, err := behaviorClient.R().SetBodyBytes([]byte("payload")).Get(targetURL + "/body")
+	if err != nil || bodyResponse.StatusCode != http.StatusNoContent || <-protocol != 3 || <-requestBodies != "payload" {
+		t.Fatalf("GET body response=%v err=%v", bodyResponse, err)
+	}
+	redirectResponse, err := behaviorClient.R().Get(targetURL + "/redirect")
+	if err != nil || redirectResponse.StatusCode != http.StatusFound || <-protocol != 3 {
+		t.Fatalf("redirect response=%v err=%v", redirectResponse, err)
+	}
+	behaviorClient.GetClient().CloseIdleConnections()
+
+	allowGetBodyFalse := false
+	noGetBodyClient, err := buildReqClient(createClientRequest{HTTPVersion: "http3", RootCAPEM: caPEM, ClientCertPEM: clientCertificatePEM, ClientKeyPEM: clientKeyPEM, AllowGetBody: &allowGetBodyFalse})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noBodyResponse, err := noGetBodyClient.R().SetBodyBytes([]byte("payload")).Get(targetURL + "/body")
+	if err != nil || noBodyResponse.StatusCode != http.StatusNoContent || <-protocol != 3 || <-requestBodies != "" {
+		t.Fatalf("disabled GET body response=%v err=%v", noBodyResponse, err)
+	}
+	noGetBodyClient.GetClient().CloseIdleConnections()
+
+	limitedHeaderClient, err := buildReqClient(createClientRequest{HTTPVersion: "http3", RootCAPEM: caPEM, ClientCertPEM: clientCertificatePEM, ClientKeyPEM: clientKeyPEM, Transport: transportConfig{MaxResponseHeaderBytes: 128}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response, requestErr := limitedHeaderClient.R().Get(targetURL + "/large-header"); requestErr == nil {
+		t.Fatalf("oversized H3 response header accepted: %#v", response)
+	}
+	if <-protocol != 3 {
+		t.Fatal("large header request did not use HTTP/3")
+	}
+	limitedHeaderClient.GetClient().CloseIdleConnections()
 	beforeClose := handshakes.Load()
 	afterClose, err := client.R().Get(targetURL)
 	if err != nil {
@@ -993,6 +1053,157 @@ func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
 		t.Fatalf("HTTP/3 connection remained after close: before=%d after=%d", beforeClose, handshakes.Load())
 	}
 	client.GetClient().CloseIdleConnections()
+
+	keepAliveConfig := createClientRequest{HTTPVersion: "http3", RootCAPEM: caPEM, ClientCertPEM: clientCertificatePEM, ClientKeyPEM: clientKeyPEM}
+	keepAliveClient, err := buildReqClient(keepAliveConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const keepAliveClientID = "http3-keepalive"
+	s.clients[keepAliveClientID] = &clientSession{client: keepAliveClient, config: keepAliveConfig, lastUsed: time.Now()}
+	handshakesBeforeReuse := handshakes.Load()
+	for range 2 {
+		bridgeResponse := sendRawRequest(t, s.routes(), keepAliveClientID, requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: targetURL})
+		if bridgeResponse.Code != http.StatusOK || <-protocol != 3 {
+			t.Fatalf("status=%d body=%s", bridgeResponse.Code, bridgeResponse.Body.String())
+		}
+	}
+	if got := handshakes.Load() - handshakesBeforeReuse; got != 1 {
+		t.Fatalf("keep_alive=true handshakes = %d", got)
+	}
+	keepAliveClient.GetClient().CloseIdleConnections()
+
+	keepAliveFalse := false
+	noKeepAliveConfig := createClientRequest{HTTPVersion: "http3", RootCAPEM: caPEM, ClientCertPEM: clientCertificatePEM, ClientKeyPEM: clientKeyPEM, KeepAlive: &keepAliveFalse}
+	noKeepAliveClient, err := buildReqClient(noKeepAliveConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const noKeepAliveClientID = "http3-no-keepalive"
+	s.clients[noKeepAliveClientID] = &clientSession{client: noKeepAliveClient, config: noKeepAliveConfig, lastUsed: time.Now()}
+	handshakesBeforeRequests := handshakes.Load()
+	for range 2 {
+		bridgeResponse := sendRawRequest(t, s.routes(), noKeepAliveClientID, requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: targetURL})
+		if bridgeResponse.Code != http.StatusOK || <-protocol != 3 {
+			t.Fatalf("status=%d body=%s", bridgeResponse.Code, bridgeResponse.Body.String())
+		}
+	}
+	if got := handshakes.Load() - handshakesBeforeRequests; got != 2 {
+		t.Fatalf("keep_alive=false handshakes = %d", got)
+	}
+
+	timeoutConfig := createClientRequest{HTTPVersion: "http3", RootCAPEM: caPEM, ClientCertPEM: clientCertificatePEM, ClientKeyPEM: clientKeyPEM}
+	timeoutClient, err := buildReqClient(timeoutConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const timeoutClientID = "http3-timeout"
+	s.clients[timeoutClientID] = &clientSession{client: timeoutClient, config: timeoutConfig, lastUsed: time.Now()}
+	warmupResponse := sendRawRequest(t, s.routes(), timeoutClientID, requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: targetURL})
+	if warmupResponse.Code != http.StatusOK || <-protocol != 3 {
+		t.Fatalf("warmup status=%d body=%s", warmupResponse.Code, warmupResponse.Body.String())
+	}
+	timeoutResponse := sendRawRequest(t, s.routes(), timeoutClientID, requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: targetURL + "/slow", TimeoutMS: 5})
+	if timeoutResponse.Code != http.StatusGatewayTimeout || decodeAPIError(t, timeoutResponse).Code != "UPSTREAM_TIMEOUT" || <-protocol != 3 {
+		t.Fatalf("timeout status=%d body=%s", timeoutResponse.Code, timeoutResponse.Body.String())
+	}
+	timeoutClient.GetClient().CloseIdleConnections()
+}
+
+func TestClientOptionsHTTP3MapsOnlyEquivalentConfiguration(t *testing.T) {
+	zero := uint32(0)
+	client, err := buildReqClient(createClientRequest{
+		HTTPVersion: "http3",
+		Transport: transportConfig{
+			TLSHandshakeTimeoutMS:  11,
+			IdleConnTimeoutMS:      12,
+			MaxResponseHeaderBytes: 4096,
+			ProxyConnectHeaders:    map[string][]string{},
+		},
+		HTTP2: http2Config{ConnectionFlow: &zero, MaxHeaderListSize: &zero},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.GetClient().Transport.(*http3.Transport)
+	if !ok {
+		t.Fatalf("transport = %T", client.GetClient().Transport)
+	}
+	if transport.QUICConfig == nil {
+		t.Fatal("QUICConfig is nil")
+	}
+	if transport.QUICConfig.HandshakeIdleTimeout != 11*time.Millisecond || transport.QUICConfig.MaxIdleTimeout != 12*time.Millisecond || transport.MaxResponseHeaderBytes != 4096 || client.GetClient().Timeout != 0 {
+		t.Fatalf("QUIC=%#v max_header=%d client_timeout=%s", transport.QUICConfig, transport.MaxResponseHeaderBytes, client.GetClient().Timeout)
+	}
+	if !transport.DisableCompression {
+		t.Fatal("HTTP/3 default compression is enabled")
+	}
+
+	connectionFlow := uint32(1)
+	maxHeaderListSize := uint32(1)
+	for _, test := range []struct {
+		field string
+		input createClientRequest
+	}{
+		{field: "proxy_url", input: createClientRequest{HTTPVersion: "http3", ProxyURL: "http://127.0.0.1:8080"}},
+		{field: "response_header_timeout_ms", input: createClientRequest{HTTPVersion: "http3", Transport: transportConfig{ResponseHeaderTimeoutMS: 1}}},
+		{field: "expect_continue_timeout_ms", input: createClientRequest{HTTPVersion: "http3", Transport: transportConfig{ExpectContinueTimeoutMS: 1}}},
+		{field: "max_idle_conns", input: createClientRequest{HTTPVersion: "http3", Transport: transportConfig{MaxIdleConns: 1}}},
+		{field: "max_idle_conns_per_host", input: createClientRequest{HTTPVersion: "http3", Transport: transportConfig{MaxIdleConnsPerHost: 1}}},
+		{field: "max_conns_per_host", input: createClientRequest{HTTPVersion: "http3", Transport: transportConfig{MaxConnsPerHost: 1}}},
+		{field: "read_buffer_size", input: createClientRequest{HTTPVersion: "http3", Transport: transportConfig{ReadBufferSize: 1}}},
+		{field: "write_buffer_size", input: createClientRequest{HTTPVersion: "http3", Transport: transportConfig{WriteBufferSize: 1}}},
+		{field: "proxy_connect_headers", input: createClientRequest{HTTPVersion: "http3", Transport: transportConfig{ProxyConnectHeaders: map[string][]string{"X-Test": {"value"}}}}},
+		{field: "http2.settings", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{Settings: []http2Setting{{ID: 1, Value: 1}}}}},
+		{field: "http2.connection_flow", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{ConnectionFlow: &connectionFlow}}},
+		{field: "http2.header_priority", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{HeaderPriority: &priorityParam{Weight: 1}}}},
+		{field: "http2.priority_frames", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{PriorityFrames: []priorityFrame{{StreamID: 1}}}}},
+		{field: "http2.max_header_list_size", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{MaxHeaderListSize: &maxHeaderListSize}}},
+		{field: "http2.strict_max_concurrent_streams", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{StrictMaxConcurrentStreams: true}}},
+		{field: "http2.read_idle_timeout_ms", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{ReadIdleTimeoutMS: 1}}},
+		{field: "http2.ping_timeout_ms", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{PingTimeoutMS: 1}}},
+		{field: "http2.write_byte_timeout_ms", input: createClientRequest{HTTPVersion: "http3", HTTP2: http2Config{WriteByteTimeoutMS: 1}}},
+	} {
+		if _, buildErr := buildReqClient(test.input); buildErr == nil || !strings.Contains(buildErr.Error(), test.field) {
+			t.Fatalf("field %s error = %v", test.field, buildErr)
+		}
+	}
+
+	s := newServer("", 48<<20, time.Hour)
+	response := httptest.NewRecorder()
+	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3","transport":{"read_buffer_size":1}}`)))
+	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "read_buffer_size") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3","transport":{"proxy_connect_headers":{}},"http2":{"connection_flow":0,"max_header_list_size":0}}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("default-valued HTTP/3 options rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestHTTP3RejectsConnectionSpecificRequestOptions(t *testing.T) {
+	client, err := buildReqClient(createClientRequest{HTTPVersion: "http3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer("", 48<<20, time.Hour)
+	const clientID = "http3-request-options"
+	s.clients[clientID] = &clientSession{client: client, config: createClientRequest{HTTPVersion: "http3"}, lastUsed: time.Now()}
+	for _, test := range []struct {
+		field   string
+		options requestOptions
+	}{
+		{field: "force_chunked", options: requestOptions{ForceChunked: true}},
+		{field: "close_connection", options: requestOptions{CloseConnection: true}},
+		{field: "header_order", options: requestOptions{HeaderOrder: []string{"accept"}}},
+		{field: "pseudo_header_order", options: requestOptions{PseudoHeaderOrder: []string{":method"}}},
+	} {
+		response := sendRawRequest(t, s.routes(), clientID, requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: "https://127.0.0.1:1", Options: test.options})
+		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), test.field) {
+			t.Fatalf("field=%s status=%d body=%s", test.field, response.Code, response.Body.String())
+		}
+	}
 }
 
 func TestClientOptionsRejectUnsafeProtocolCombinations(t *testing.T) {

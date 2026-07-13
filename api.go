@@ -26,6 +26,7 @@ import (
 
 	"github.com/imroc/req/v3"
 	"github.com/imroc/req/v3/http2"
+	"github.com/quic-go/quic-go"
 	quichttp3 "github.com/quic-go/quic-go/http3"
 	utls "github.com/refraction-networking/utls"
 )
@@ -547,6 +548,26 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(http.StatusBadRequest, validationError.Code, validationError.Message, false)
 		return
 	}
+	if session.config.HTTPVersion == "http3" {
+		unsupportedField := ""
+		switch {
+		case input.Options.ForceChunked:
+			unsupportedField = "force_chunked"
+		case input.Options.CloseConnection:
+			unsupportedField = "close_connection"
+		case len(input.Options.HeaderOrder) > 0:
+			unsupportedField = "header_order"
+		case len(input.Options.PseudoHeaderOrder) > 0:
+			unsupportedField = "pseudo_header_order"
+		}
+		if unsupportedField != "" {
+			writeError(http.StatusBadRequest, "INVALID_REQUEST", unsupportedField+" is unsupported with HTTP/3", false)
+			return
+		}
+		if session.config.KeepAlive != nil && !*session.config.KeepAlive {
+			defer session.client.GetClient().CloseIdleConnections()
+		}
+	}
 
 	ctx := r.Context()
 	if input.TimeoutMS > 0 {
@@ -864,6 +885,7 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 	client.GetClient().CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
+	client.GetClient().Timeout = 0
 
 	verify := true
 	if input.Verify != nil {
@@ -915,13 +937,15 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 	case "", "auto":
 		client.DisableForceHttpVersion()
 	}
-	if input.KeepAlive != nil && !*input.KeepAlive {
-		client.DisableKeepAlives()
-	} else {
-		client.EnableKeepAlives()
-	}
-	if input.Compression {
-		client.EnableCompression()
+	if input.HTTPVersion != "http3" {
+		if input.KeepAlive != nil && !*input.KeepAlive {
+			client.DisableKeepAlives()
+		} else {
+			client.EnableKeepAlives()
+		}
+		if input.Compression {
+			client.EnableCompression()
+		}
 	}
 	if input.AllowGetBody != nil && !*input.AllowGetBody {
 		client.DisableAllowGetMethodPayload()
@@ -929,82 +953,87 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 		client.EnableAllowGetMethodPayload()
 	}
 
-	transport := client.GetTransport()
-	if input.Transport.TLSHandshakeTimeoutMS != 0 {
-		transport.SetTLSHandshakeTimeout(time.Duration(input.Transport.TLSHandshakeTimeoutMS) * time.Millisecond)
-	}
-	if input.Transport.ResponseHeaderTimeoutMS != 0 {
-		transport.SetResponseHeaderTimeout(time.Duration(input.Transport.ResponseHeaderTimeoutMS) * time.Millisecond)
-	}
-	if input.Transport.ExpectContinueTimeoutMS != 0 {
-		transport.SetExpectContinueTimeout(time.Duration(input.Transport.ExpectContinueTimeoutMS) * time.Millisecond)
-	}
-	if input.Transport.IdleConnTimeoutMS != 0 {
-		transport.SetIdleConnTimeout(time.Duration(input.Transport.IdleConnTimeoutMS) * time.Millisecond)
-	}
-	if input.Transport.MaxIdleConns != 0 {
-		transport.SetMaxIdleConns(input.Transport.MaxIdleConns)
-	}
-	if input.Transport.MaxIdleConnsPerHost != 0 {
-		transport.MaxIdleConnsPerHost = input.Transport.MaxIdleConnsPerHost
-	}
-	if input.Transport.MaxConnsPerHost != 0 {
-		transport.SetMaxConnsPerHost(input.Transport.MaxConnsPerHost)
-	}
-	if input.Transport.MaxResponseHeaderBytes != 0 {
-		transport.SetMaxResponseHeaderBytes(input.Transport.MaxResponseHeaderBytes)
-	}
-	if input.Transport.ReadBufferSize != 0 {
-		transport.SetReadBufferSize(input.Transport.ReadBufferSize)
-	}
-	if input.Transport.WriteBufferSize != 0 {
-		transport.SetWriteBufferSize(input.Transport.WriteBufferSize)
-	}
 	if input.HTTPVersion == "http3" {
 		client.GetClient().Transport = &quichttp3.Transport{
-			TLSClientConfig:        client.GetTLSClientConfig().Clone(),
+			TLSClientConfig: client.GetTLSClientConfig().Clone(),
+			QUICConfig: &quic.Config{
+				HandshakeIdleTimeout: time.Duration(input.Transport.TLSHandshakeTimeoutMS) * time.Millisecond,
+				MaxIdleTimeout:       time.Duration(input.Transport.IdleConnTimeoutMS) * time.Millisecond,
+			},
 			MaxResponseHeaderBytes: int(input.Transport.MaxResponseHeaderBytes),
 			DisableCompression:     !input.Compression,
 		}
-	}
-	if input.Transport.ProxyConnectHeaders != nil {
-		transport.SetProxyConnectHeader(http.Header(input.Transport.ProxyConnectHeaders))
-	}
+	} else {
+		transport := client.GetTransport()
+		if input.Transport.TLSHandshakeTimeoutMS != 0 {
+			transport.SetTLSHandshakeTimeout(time.Duration(input.Transport.TLSHandshakeTimeoutMS) * time.Millisecond)
+		}
+		if input.Transport.ResponseHeaderTimeoutMS != 0 {
+			transport.SetResponseHeaderTimeout(time.Duration(input.Transport.ResponseHeaderTimeoutMS) * time.Millisecond)
+		}
+		if input.Transport.ExpectContinueTimeoutMS != 0 {
+			transport.SetExpectContinueTimeout(time.Duration(input.Transport.ExpectContinueTimeoutMS) * time.Millisecond)
+		}
+		if input.Transport.IdleConnTimeoutMS != 0 {
+			transport.SetIdleConnTimeout(time.Duration(input.Transport.IdleConnTimeoutMS) * time.Millisecond)
+		}
+		if input.Transport.MaxIdleConns != 0 {
+			transport.SetMaxIdleConns(input.Transport.MaxIdleConns)
+		}
+		if input.Transport.MaxIdleConnsPerHost != 0 {
+			transport.MaxIdleConnsPerHost = input.Transport.MaxIdleConnsPerHost
+		}
+		if input.Transport.MaxConnsPerHost != 0 {
+			transport.SetMaxConnsPerHost(input.Transport.MaxConnsPerHost)
+		}
+		if input.Transport.MaxResponseHeaderBytes != 0 {
+			transport.SetMaxResponseHeaderBytes(input.Transport.MaxResponseHeaderBytes)
+		}
+		if input.Transport.ReadBufferSize != 0 {
+			transport.SetReadBufferSize(input.Transport.ReadBufferSize)
+		}
+		if input.Transport.WriteBufferSize != 0 {
+			transport.SetWriteBufferSize(input.Transport.WriteBufferSize)
+		}
+		if input.Transport.ProxyConnectHeaders != nil {
+			transport.SetProxyConnectHeader(http.Header(input.Transport.ProxyConnectHeaders))
+		}
 
-	if len(input.HTTP2.Settings) > 0 {
-		settings := make([]http2.Setting, len(input.HTTP2.Settings))
-		for i, setting := range input.HTTP2.Settings {
-			settings[i] = http2.Setting{ID: http2.SettingID(setting.ID), Val: setting.Value}
+		if len(input.HTTP2.Settings) > 0 {
+			settings := make([]http2.Setting, len(input.HTTP2.Settings))
+			for i, setting := range input.HTTP2.Settings {
+				settings[i] = http2.Setting{ID: http2.SettingID(setting.ID), Val: setting.Value}
+			}
+			client.SetHTTP2SettingsFrame(settings...)
 		}
-		client.SetHTTP2SettingsFrame(settings...)
-	}
-	if input.HTTP2.ConnectionFlow != nil && *input.HTTP2.ConnectionFlow != 0 {
-		client.SetHTTP2ConnectionFlow(*input.HTTP2.ConnectionFlow)
-	}
-	if input.HTTP2.HeaderPriority != nil {
-		client.SetHTTP2HeaderPriority(toHTTP2Priority(*input.HTTP2.HeaderPriority))
-	}
-	if len(input.HTTP2.PriorityFrames) > 0 {
-		frames := make([]http2.PriorityFrame, len(input.HTTP2.PriorityFrames))
-		for i, frame := range input.HTTP2.PriorityFrames {
-			frames[i] = http2.PriorityFrame{StreamID: frame.StreamID, PriorityParam: toHTTP2Priority(frame.Priority)}
+		if input.HTTP2.ConnectionFlow != nil && *input.HTTP2.ConnectionFlow != 0 {
+			client.SetHTTP2ConnectionFlow(*input.HTTP2.ConnectionFlow)
 		}
-		client.SetHTTP2PriorityFrames(frames...)
-	}
-	if input.HTTP2.MaxHeaderListSize != nil && *input.HTTP2.MaxHeaderListSize != 0 {
-		client.SetHTTP2MaxHeaderListSize(*input.HTTP2.MaxHeaderListSize)
-	}
-	if input.HTTP2.StrictMaxConcurrentStreams {
-		client.SetHTTP2StrictMaxConcurrentStreams(true)
-	}
-	if input.HTTP2.ReadIdleTimeoutMS != 0 {
-		client.SetHTTP2ReadIdleTimeout(time.Duration(input.HTTP2.ReadIdleTimeoutMS) * time.Millisecond)
-	}
-	if input.HTTP2.PingTimeoutMS != 0 {
-		client.SetHTTP2PingTimeout(time.Duration(input.HTTP2.PingTimeoutMS) * time.Millisecond)
-	}
-	if input.HTTP2.WriteByteTimeoutMS != 0 {
-		client.SetHTTP2WriteByteTimeout(time.Duration(input.HTTP2.WriteByteTimeoutMS) * time.Millisecond)
+		if input.HTTP2.HeaderPriority != nil {
+			client.SetHTTP2HeaderPriority(toHTTP2Priority(*input.HTTP2.HeaderPriority))
+		}
+		if len(input.HTTP2.PriorityFrames) > 0 {
+			frames := make([]http2.PriorityFrame, len(input.HTTP2.PriorityFrames))
+			for i, frame := range input.HTTP2.PriorityFrames {
+				frames[i] = http2.PriorityFrame{StreamID: frame.StreamID, PriorityParam: toHTTP2Priority(frame.Priority)}
+			}
+			client.SetHTTP2PriorityFrames(frames...)
+		}
+		if input.HTTP2.MaxHeaderListSize != nil && *input.HTTP2.MaxHeaderListSize != 0 {
+			client.SetHTTP2MaxHeaderListSize(*input.HTTP2.MaxHeaderListSize)
+		}
+		if input.HTTP2.StrictMaxConcurrentStreams {
+			client.SetHTTP2StrictMaxConcurrentStreams(true)
+		}
+		if input.HTTP2.ReadIdleTimeoutMS != 0 {
+			client.SetHTTP2ReadIdleTimeout(time.Duration(input.HTTP2.ReadIdleTimeoutMS) * time.Millisecond)
+		}
+		if input.HTTP2.PingTimeoutMS != 0 {
+			client.SetHTTP2PingTimeout(time.Duration(input.HTTP2.PingTimeoutMS) * time.Millisecond)
+		}
+		if input.HTTP2.WriteByteTimeoutMS != 0 {
+			client.SetHTTP2WriteByteTimeout(time.Duration(input.HTTP2.WriteByteTimeoutMS) * time.Millisecond)
+		}
 	}
 
 	if input.Retry.Count > 0 {
@@ -1164,7 +1193,7 @@ func validateClientConfig(input createClientRequest) error {
 		return fmt.Errorf("invalid HTTP version %q", input.HTTPVersion)
 	}
 	if input.ProxyURL != "" && (httpVersion == "http2" || httpVersion == "http3" || httpVersion == "h2c") {
-		return errors.New("proxy URL cannot be combined with forced HTTP/2, HTTP/3, or H2C")
+		return errors.New("proxy_url cannot be combined with forced HTTP/2, HTTP/3, or H2C")
 	}
 	if httpVersion == "http3" && (input.tlsFingerprintSet || input.TLSFingerprint != "" && input.TLSFingerprint != "android_11_okhttp" || impersonate != "none") {
 		return errors.New("HTTP/3 cannot be combined with TLS fingerprint or impersonate")
@@ -1175,7 +1204,43 @@ func validateClientConfig(input createClientRequest) error {
 	if err := validateHTTP2Config(input.HTTP2); err != nil {
 		return err
 	}
+	if httpVersion == "http3" {
+		if err := validateHTTP3Config(input); err != nil {
+			return err
+		}
+	}
 	return validateRetryConfig(input.Retry)
+}
+
+func validateHTTP3Config(input createClientRequest) error {
+	unsupported := []struct {
+		field string
+		set   bool
+	}{
+		{field: "response_header_timeout_ms", set: input.Transport.ResponseHeaderTimeoutMS != 0},
+		{field: "expect_continue_timeout_ms", set: input.Transport.ExpectContinueTimeoutMS != 0},
+		{field: "max_idle_conns", set: input.Transport.MaxIdleConns != 0},
+		{field: "max_idle_conns_per_host", set: input.Transport.MaxIdleConnsPerHost != 0},
+		{field: "max_conns_per_host", set: input.Transport.MaxConnsPerHost != 0},
+		{field: "read_buffer_size", set: input.Transport.ReadBufferSize != 0},
+		{field: "write_buffer_size", set: input.Transport.WriteBufferSize != 0},
+		{field: "proxy_connect_headers", set: len(input.Transport.ProxyConnectHeaders) > 0},
+		{field: "http2.settings", set: len(input.HTTP2.Settings) > 0},
+		{field: "http2.connection_flow", set: input.HTTP2.ConnectionFlow != nil && *input.HTTP2.ConnectionFlow != 0},
+		{field: "http2.header_priority", set: input.HTTP2.HeaderPriority != nil},
+		{field: "http2.priority_frames", set: len(input.HTTP2.PriorityFrames) > 0},
+		{field: "http2.max_header_list_size", set: input.HTTP2.MaxHeaderListSize != nil && *input.HTTP2.MaxHeaderListSize != 0},
+		{field: "http2.strict_max_concurrent_streams", set: input.HTTP2.StrictMaxConcurrentStreams},
+		{field: "http2.read_idle_timeout_ms", set: input.HTTP2.ReadIdleTimeoutMS != 0},
+		{field: "http2.ping_timeout_ms", set: input.HTTP2.PingTimeoutMS != 0},
+		{field: "http2.write_byte_timeout_ms", set: input.HTTP2.WriteByteTimeoutMS != 0},
+	}
+	for _, option := range unsupported {
+		if option.set {
+			return fmt.Errorf("%s is unsupported with HTTP/3", option.field)
+		}
+	}
+	return nil
 }
 
 func validateRootCAPEM(content string) error {
