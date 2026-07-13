@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -33,11 +34,32 @@ import (
 
 const (
 	protocolVersion      = 1
+	serverVersion        = "1.0.0"
 	maxClientConfigBytes = 4 << 20
 	retryNone            = "none"
 	retryFixed           = "fixed"
 	retryBackoff         = "backoff"
 )
+
+func versionLine() string {
+	versions := map[string]string{}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, dependency := range info.Deps {
+			version := dependency.Version
+			if dependency.Replace != nil {
+				version = dependency.Replace.Version
+			}
+			versions[dependency.Path] = version
+		}
+	}
+	return fmt.Sprintf(
+		"GoHTTPX server %s protocol %d req/v3 %s uTLS %s",
+		serverVersion,
+		protocolVersion,
+		versions["github.com/imroc/req/v3"],
+		versions["github.com/refraction-networking/utls"],
+	)
+}
 
 var errUnsupportedTLSFingerprint = errors.New("unsupported TLS fingerprint")
 
@@ -422,7 +444,7 @@ func (s *server) Close() {
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, healthResponse{Status: "ok", ProtocolVersion: protocolVersion, ServerVersion: "1.0.0"})
+		writeJSON(w, http.StatusOK, healthResponse{Status: "ok", ProtocolVersion: protocolVersion, ServerVersion: serverVersion})
 	})
 	mux.Handle("GET /api/v1/capabilities", s.authenticate(http.HandlerFunc(s.handleCapabilities)))
 	mux.Handle("POST /api/v1/clients", s.authenticate(http.HandlerFunc(s.handleCreateClient)))
@@ -457,7 +479,7 @@ func (s *server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 		TLSFingerprints []string `json:"tls_fingerprints"`
 	}{
 		ProtocolVersion: protocolVersion,
-		ServerVersion:   "1.0.0",
+		ServerVersion:   serverVersion,
 		MaxBodyBytes:    s.maxBodyBytes,
 		TLSFingerprints: tlsFingerprints,
 	})

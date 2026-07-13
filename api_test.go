@@ -23,7 +23,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
+	"os"
+	"os/exec"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,8 +61,67 @@ func TestHealth(t *testing.T) {
 	if err := json.Unmarshal(health.Body.Bytes(), &h); err != nil {
 		t.Fatal(err)
 	}
-	if h.Status != "ok" || h.ProtocolVersion != 1 {
+	if h.Status != "ok" || h.ProtocolVersion != 1 || h.ServerVersion != serverVersion {
 		t.Fatalf("health = %#v", h)
+	}
+}
+
+func TestCapabilitiesUseExactServerVersionEnvelope(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	response := httptest.NewRecorder()
+	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/capabilities", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var capabilities map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &capabilities); err != nil {
+		t.Fatal(err)
+	}
+	wantFields := []string{"max_body_bytes", "protocol_version", "server_version", "tls_fingerprints"}
+	gotFields := make([]string, 0, len(capabilities))
+	for name := range capabilities {
+		gotFields = append(gotFields, name)
+	}
+	sort.Strings(gotFields)
+	if !reflect.DeepEqual(gotFields, wantFields) {
+		t.Fatalf("capabilities fields = %q", gotFields)
+	}
+	var version string
+	if err := json.Unmarshal(capabilities["server_version"], &version); err != nil {
+		t.Fatal(err)
+	}
+	if version != serverVersion {
+		t.Fatalf("server_version = %q", version)
+	}
+}
+
+func TestVersionFlagNeedsNoTokenAndReportsFixedBuildVersions(t *testing.T) {
+	command := exec.Command("go", "run", ".", "--version")
+	command.Env = append(os.Environ(), "GOHTTPX_TOKEN=")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--version failed: %v\n%s", err, output)
+	}
+	want := "GoHTTPX server 1.0.0 protocol 1 req/v3 v3.59.0 uTLS v1.8.2\n"
+	if string(output) != want {
+		t.Fatalf("--version output = %q, want %q", output, want)
+	}
+}
+
+func TestCLIFlagTokenOverridesEnvironment(t *testing.T) {
+	options, err := parseCLI([]string{"--token", "flag-secret"}, "env-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.token != "flag-secret" {
+		t.Fatalf("token = %q", options.token)
+	}
+	options, err = parseCLI(nil, "env-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.token != "env-secret" {
+		t.Fatalf("environment token = %q", options.token)
 	}
 }
 

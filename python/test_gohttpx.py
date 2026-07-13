@@ -18,6 +18,7 @@ from urllib.request import parse_http_list, parse_keqv_list
 import httpx
 
 from gohttpx import (
+    __version__,
     AsyncClient,
     Client,
     ClientOptions,
@@ -338,6 +339,7 @@ class ClientTests(unittest.TestCase):
         self.thread.join()
 
     def test_enum_matches_go_capabilities_and_default_create_contract(self):
+        self.assertEqual(__version__, "1.0.0")
         self.assertEqual({item.value for item in TLSFingerprint}, set(FINGERPRINTS))
         self.assertEqual(len(TLSFingerprint), 49)
         client = Client(go_endpoint=self.endpoint, go_token="secret")
@@ -1691,6 +1693,18 @@ class GoHTTPXE2ETests(unittest.TestCase):
     def setUp(self):
         with self.target_state.lock:
             self.target_state.calls.clear()
+
+    def test_server_health_capabilities_and_python_versions_match(self):
+        health = httpx.get(self.go_endpoint + "/api/v1/health", timeout=1, trust_env=False)
+        capabilities = httpx.get(
+            self.go_endpoint + "/api/v1/capabilities",
+            headers={"Authorization": f"Bearer {self.token}"},
+            timeout=1,
+            trust_env=False,
+        )
+        self.assertEqual(health.json()["server_version"], __version__)
+        self.assertEqual(capabilities.json()["server_version"], __version__)
+        self.assertEqual(set(capabilities.json()), {"protocol_version", "server_version", "max_body_bytes", "tls_fingerprints"})
 
     def test_body_modes_reach_target_as_httpx_encoded_bytes(self):
         with Client(go_endpoint=self.go_endpoint, go_token=self.token) as client:

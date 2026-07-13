@@ -15,6 +15,8 @@ from urllib.parse import quote
 
 import httpx
 
+__version__ = "1.0.0"
+
 
 class TLSFingerprint(str, Enum):
     GOLANG = "golang"
@@ -1123,6 +1125,7 @@ class AsyncClient(httpx.AsyncClient):
 
 
 __all__ = [
+    "__version__",
     "AsyncClient",
     "Client",
     "ClientOptions",
