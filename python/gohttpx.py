@@ -2,6 +2,7 @@ import base64
 import json
 import math
 import os
+import re
 import ssl
 import threading
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -85,11 +86,11 @@ class RetryOptions:
 
 @dataclass(frozen=True)
 class TransportOptions:
-    tls_handshake_timeout_ms: int = 0
+    tls_handshake_timeout_ms: int = 10000
     response_header_timeout_ms: int = 0
-    expect_continue_timeout_ms: int = 0
-    idle_conn_timeout_ms: int = 0
-    max_idle_conns: int = 0
+    expect_continue_timeout_ms: int = 1000
+    idle_conn_timeout_ms: int = 90000
+    max_idle_conns: int = 100
     max_idle_conns_per_host: int = 0
     max_conns_per_host: int = 0
     max_response_header_bytes: int = 0
@@ -190,6 +191,10 @@ _HTTP_VERSIONS = {
     "HTTP/3": b"HTTP/3",
 }
 _HTTP_TOKEN_BYTES = frozenset(b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+_RFC3339_TIMESTAMP = re.compile(
+    r"(?P<date>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?(?P<timezone>Z|[+-]\d{2}:\d{2})"
+)
 _REQUEST_OPTION_FIELDS = {item.name for item in fields(RequestOptions)}
 
 
@@ -300,6 +305,11 @@ class _GoTransport(httpx.BaseTransport):
             payload = _wire(options)
             payload["protocol_version"] = 1
             impersonate = payload.get("impersonate", "none")
+            if payload.get("http_version") == "http3":
+                defaults = TransportOptions()
+                for name in ("expect_continue_timeout_ms", "max_idle_conns"):
+                    if getattr(options.transport, name) == getattr(defaults, name):
+                        payload["transport"][name] = 0
             if "tls_fingerprint" not in payload and impersonate == "none" and payload.get("http_version") != "http3":
                 payload["tls_fingerprint"] = TLSFingerprint.ANDROID_11_OKHTTP.value
             created = self._call("POST", "/api/v1/clients", payload, None, expected_status=201)
@@ -313,8 +323,16 @@ class _GoTransport(httpx.BaseTransport):
             expires_at = created["expires_at"]
             if not isinstance(client_id, str) or not client_id or not isinstance(expires_at, str) or not expires_at:
                 raise GoProtocolError("创建会话响应缺少合法字段")
+            timestamp = _RFC3339_TIMESTAMP.fullmatch(expires_at)
+            if timestamp is None:
+                raise GoProtocolError("创建会话响应包含非法 expires_at")
+            normalized = timestamp.group("date")
+            if fraction := timestamp.group("fraction"):
+                normalized += "." + fraction[:6].ljust(6, "0")
+            timezone = timestamp.group("timezone")
+            normalized += "+00:00" if timezone == "Z" else timezone
             try:
-                expires = datetime.fromisoformat(expires_at[:-1] + "+00:00" if expires_at.endswith("Z") else expires_at)
+                expires = datetime.fromisoformat(normalized)
             except ValueError as exc:
                 raise GoProtocolError("创建会话响应包含非法 expires_at") from exc
             if expires.tzinfo is None:
@@ -671,7 +689,10 @@ class Client(httpx.Client):
                 default_encoding=default_encoding,
             )
         except BaseException:
-            go_transport.close()
+            try:
+                go_transport.close()
+            except BaseException:
+                pass
             raise
 
 

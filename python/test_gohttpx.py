@@ -309,6 +309,23 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(create["impersonate"], "none")
         self.assertEqual(create["http_version"], "auto")
         self.assertTrue(create["verify"])
+        self.assertEqual(
+            {
+                name: create["transport"][name]
+                for name in (
+                    "tls_handshake_timeout_ms",
+                    "expect_continue_timeout_ms",
+                    "idle_conn_timeout_ms",
+                    "max_idle_conns",
+                )
+            },
+            {
+                "tls_handshake_timeout_ms": 10000,
+                "expect_continue_timeout_ms": 1000,
+                "idle_conn_timeout_ms": 90000,
+                "max_idle_conns": 100,
+            },
+        )
 
     def test_explicit_fingerprint_and_all_client_options_are_serialized(self):
         options = ClientOptions(
@@ -359,15 +376,19 @@ class ClientTests(unittest.TestCase):
 
     def test_http3_default_omits_fingerprint_and_unsupported_transport_defaults(self):
         self.state.enforce_http3_create = True
+        options = ClientOptions(http_version="http3")
         with Client(
             go_endpoint=self.endpoint,
-            client_options=ClientOptions(http_version="http3"),
+            client_options=options,
         ):
             pass
         create = self.state.calls[1]["payload"]
         self.assertNotIn("tls_fingerprint", create)
         self.assertFalse(create["transport"]["expect_continue_timeout_ms"])
         self.assertFalse(create["transport"]["max_idle_conns"])
+        self.assertEqual(create["transport"]["tls_handshake_timeout_ms"], 10000)
+        self.assertEqual(create["transport"]["idle_conn_timeout_ms"], 90000)
+        self.assertEqual(options.transport, TransportOptions())
 
         self.state.calls.clear()
         with self.assertRaises(GoProtocolError) as caught:
@@ -380,6 +401,23 @@ class ClientTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "INVALID_REQUEST")
         self.assertIn("tls_fingerprint", self.state.calls[1]["payload"])
+
+        for name, value, transport in (
+            ("expect_continue_timeout_ms", 2000, TransportOptions(expect_continue_timeout_ms=2000)),
+            ("max_idle_conns", 101, TransportOptions(max_idle_conns=101)),
+        ):
+            with self.subTest(transport=transport):
+                self.state.calls.clear()
+                with self.assertRaises(GoProtocolError) as caught:
+                    Client(
+                        go_endpoint=self.endpoint,
+                        client_options=ClientOptions(http_version="http3", transport=transport),
+                    )
+                self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+                sent = self.state.calls[1]["payload"]["transport"]
+                self.assertEqual(sent[name], value)
+                self.assertEqual(sent["tls_handshake_timeout_ms"], 10000)
+                self.assertEqual(sent["idle_conn_timeout_ms"], 90000)
 
     def test_prepared_json_data_files_and_content_are_forwarded_as_bytes(self):
         with Client(go_endpoint=self.endpoint) as client:
@@ -646,6 +684,21 @@ class ClientTests(unittest.TestCase):
             {
                 "protocol_version": 1,
                 "client_id": "client-1",
+                "expires_at": "2026-07-14 00:00:00+00:00",
+            },
+            {
+                "protocol_version": 1,
+                "client_id": "client-1",
+                "expires_at": "2026-07-14T00:00:00+0000",
+            },
+            {
+                "protocol_version": 1,
+                "client_id": "client-1",
+                "expires_at": "2026-07-14T00:00:00.1234567890Z",
+            },
+            {
+                "protocol_version": 1,
+                "client_id": "client-1",
                 "expires_at": "2026-07-14T00:00:00Z",
                 "extra": True,
             },
@@ -671,9 +724,32 @@ class ClientTests(unittest.TestCase):
                     ],
                 )
 
+    def test_create_accepts_rfc3339_nano_and_offset_expires_at(self):
+        for expires_at in (
+            "2026-07-14T00:00:00.123456789Z",
+            "2026-07-14T08:00:00+08:00",
+        ):
+            with self.subTest(expires_at=expires_at):
+                self.state.calls.clear()
+                self.state.create_response = (
+                    201,
+                    json.dumps(
+                        {
+                            "protocol_version": 1,
+                            "client_id": "client-1",
+                            "expires_at": expires_at,
+                        }
+                    ).encode(),
+                    "application/json",
+                )
+                with Client(go_endpoint=self.endpoint):
+                    pass
+
     def test_parent_initialization_failure_deletes_created_session(self):
-        with self.assertRaises(TypeError):
+        self.state.delete_response = (500, b"cleanup failed", "text/plain")
+        with self.assertRaises(TypeError) as caught:
             Client(go_endpoint=self.endpoint, auth=object())
+        self.assertIn('Invalid "auth" argument', str(caught.exception))
         self.assertEqual(
             [(call["method"], call["path"]) for call in self.state.calls],
             [
