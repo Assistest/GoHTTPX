@@ -1182,6 +1182,56 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.state.create_count, 2)
 
+    async def test_aclose_waits_for_cancelled_only_waiter_create_and_deletes_session(self):
+        self.state.block_create = True
+        client = AsyncClient(go_endpoint=self.endpoint)
+        request_task = asyncio.create_task(client.get("https://target.test/cancelled"))
+        self.assertTrue(await asyncio.to_thread(self.state.create_started.wait, 1))
+        request_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await request_task
+
+        close_task = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0.05)
+        self.assertFalse(close_task.done())
+        self.state.release_create.set()
+        await close_task
+
+        paths = [call["path"] for call in self.state.calls]
+        self.assertEqual(paths.count("/api/v1/clients"), 1)
+        self.assertEqual(paths.count("/api/v1/clients/client-1"), 1)
+        self.assertFalse(any(path.endswith("/requests") for path in paths))
+
+    async def test_aclose_observes_cancelled_waiters_failed_create_without_raising_it(self):
+        self.state.block_create = True
+        self.state.create_response = (
+            500,
+            b'{"error":{"code":"INTERNAL_ERROR","message":"create failed","retryable":false}}',
+            "application/json",
+        )
+        client = AsyncClient(go_endpoint=self.endpoint)
+        request_tasks = [
+            asyncio.create_task(client.get(f"https://target.test/{index}"))
+            for index in range(4)
+        ]
+        self.assertTrue(await asyncio.to_thread(self.state.create_started.wait, 1))
+        await asyncio.sleep(0.05)
+        for task in request_tasks:
+            task.cancel()
+        results = await asyncio.gather(*request_tasks, return_exceptions=True)
+        self.assertTrue(all(isinstance(result, asyncio.CancelledError) for result in results))
+
+        close_task = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0.05)
+        self.assertFalse(close_task.done())
+        self.state.release_create.set()
+        await close_task
+
+        paths = [call["path"] for call in self.state.calls]
+        self.assertEqual(paths.count("/api/v1/capabilities"), 1)
+        self.assertEqual(paths.count("/api/v1/clients"), 1)
+        self.assertFalse(any(path.endswith("/requests") for path in paths))
+
     async def test_async_concurrent_client_not_found_rebuild_is_single_flight(self):
         client = AsyncClient(go_endpoint=self.endpoint)
         await client.get("https://target.test/warm")

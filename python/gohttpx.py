@@ -770,6 +770,12 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
                     pass
             raise
 
+    async def _run_initial_session_attempt(self, request: httpx.Request) -> str:
+        client_id = await self._create_session(request)
+        async with self._session_lock:
+            self._client_id = client_id
+        return client_id
+
     async def _ensure_session(self, request: httpx.Request) -> tuple[str, int]:
         async with self._session_lock:
             if self._client_id is not None:
@@ -778,7 +784,7 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
                 if self._closing or self._closed:
                     raise GoServiceUnavailable("Go transport 已关闭", request=request)
             if self._session_attempt is None:
-                self._session_attempt = asyncio.create_task(self._create_session(request))
+                self._session_attempt = asyncio.create_task(self._run_initial_session_attempt(request))
             attempt = self._session_attempt
             self._session_attempt_waiters += 1
 
@@ -788,14 +794,16 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
             async with self._session_lock:
                 self._session_attempt_waiters -= 1
                 if attempt.done() and not self._session_attempt_waiters:
+                    try:
+                        attempt.exception()
+                    except BaseException:
+                        pass
                     self._session_attempt = None
             if isinstance(exc, Exception):
                 raise _retarget_transport_error(exc, request) from exc
             raise
 
         async with self._session_lock:
-            if self._client_id is None:
-                self._client_id = client_id
             self._session_attempt_waiters -= 1
             if not self._session_attempt_waiters:
                 self._session_attempt = None
@@ -865,6 +873,17 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
             self._closing = True
             while self._active:
                 await self._condition.wait()
+
+        async with self._session_lock:
+            attempt = self._session_attempt
+        if attempt is not None:
+            try:
+                await asyncio.shield(attempt)
+            except Exception:
+                pass
+        async with self._session_lock:
+            if attempt is not None and attempt is self._session_attempt and attempt.done() and not self._session_attempt_waiters:
+                self._session_attempt = None
             client_id = self._client_id
 
         error = None
