@@ -5,6 +5,7 @@ import os
 import ssl
 import threading
 from dataclasses import dataclass, field, fields, is_dataclass, replace
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -84,11 +85,11 @@ class RetryOptions:
 
 @dataclass(frozen=True)
 class TransportOptions:
-    tls_handshake_timeout_ms: int = 10000
+    tls_handshake_timeout_ms: int = 0
     response_header_timeout_ms: int = 0
-    expect_continue_timeout_ms: int = 1000
-    idle_conn_timeout_ms: int = 90000
-    max_idle_conns: int = 100
+    expect_continue_timeout_ms: int = 0
+    idle_conn_timeout_ms: int = 0
+    max_idle_conns: int = 0
     max_idle_conns_per_host: int = 0
     max_conns_per_host: int = 0
     max_response_header_bytes: int = 0
@@ -177,6 +178,9 @@ class GoProtocolError(httpx.TransportError):
 
 
 _UNSET = object()
+_LOCAL_CONTROL_TIMEOUT = 1.0
+_TARGET_TIMEOUT_GRACE = 1.0
+_MAX_TARGET_TIMEOUT = 600.0
 _HTTP_VERSIONS = {
     "HTTP/1.0": b"HTTP/1.0",
     "HTTP/1.1": b"HTTP/1.1",
@@ -185,6 +189,7 @@ _HTTP_VERSIONS = {
     "HTTP/3.0": b"HTTP/3",
     "HTTP/3": b"HTTP/3",
 }
+_HTTP_TOKEN_BYTES = frozenset(b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
 _REQUEST_OPTION_FIELDS = {item.name for item in fields(RequestOptions)}
 
 
@@ -298,14 +303,30 @@ class _GoTransport(httpx.BaseTransport):
             if "tls_fingerprint" not in payload and impersonate == "none" and payload.get("http_version") != "http3":
                 payload["tls_fingerprint"] = TLSFingerprint.ANDROID_11_OKHTTP.value
             created = self._call("POST", "/api/v1/clients", payload, None, expected_status=201)
-            if type(created.get("protocol_version")) is not int or created["protocol_version"] != 1:
-                raise GoProtocolError("创建会话响应的 protocol_version 非 v1")
             client_id = created.get("client_id")
-            if not isinstance(client_id, str) or not client_id or not isinstance(created.get("expires_at"), str):
+            if isinstance(client_id, str) and client_id:
+                self._client_id = client_id
+            if set(created) != {"protocol_version", "client_id", "expires_at"}:
+                raise GoProtocolError("创建会话响应包含非法字段")
+            if type(created["protocol_version"]) is not int or created["protocol_version"] != 1:
+                raise GoProtocolError("创建会话响应的 protocol_version 非 v1")
+            expires_at = created["expires_at"]
+            if not isinstance(client_id, str) or not client_id or not isinstance(expires_at, str) or not expires_at:
                 raise GoProtocolError("创建会话响应缺少合法字段")
-            self._client_id = client_id
+            try:
+                expires = datetime.fromisoformat(expires_at[:-1] + "+00:00" if expires_at.endswith("Z") else expires_at)
+            except ValueError as exc:
+                raise GoProtocolError("创建会话响应包含非法 expires_at") from exc
+            if expires.tzinfo is None:
+                raise GoProtocolError("创建会话响应包含非法 expires_at")
         except BaseException:
-            self._control.close()
+            try:
+                if self._client_id is not None:
+                    self._delete_session()
+            except BaseException:
+                pass
+            finally:
+                self._control.close()
             raise
 
     def _call(
@@ -317,12 +338,16 @@ class _GoTransport(httpx.BaseTransport):
         *,
         expected_status: int = 200,
     ) -> dict[str, Any]:
+        control_timeout = _LOCAL_CONTROL_TIMEOUT
+        if request is not None:
+            timeout_ms = payload["timeout_ms"] if payload is not None else 0
+            control_timeout = (timeout_ms / 1000 if timeout_ms else _MAX_TARGET_TIMEOUT) + _TARGET_TIMEOUT_GRACE
         try:
             response = self._control.request(
                 method,
                 self._endpoint + path,
                 json=payload,
-                timeout=None if request is not None else 5.0,
+                timeout=control_timeout,
             )
         except httpx.TransportError as exc:
             raise GoServiceUnavailable("无法连接本地 Go 服务", request=request) from exc
@@ -333,13 +358,35 @@ class _GoTransport(httpx.BaseTransport):
             raise GoProtocolError("Go 服务返回了错误的状态或 envelope", request=request)
         return data
 
+    def _delete_session(self) -> None:
+        try:
+            response = self._control.delete(
+                self._endpoint + f"/api/v1/clients/{quote(self._client_id or '', safe='')}",
+                timeout=_LOCAL_CONTROL_TIMEOUT,
+            )
+        except httpx.TransportError as exc:
+            raise GoServiceUnavailable("删除 Go 会话时无法连接本地服务") from exc
+        if response.status_code >= 400:
+            _raise_control_error(_decode_json(response, None), None)
+        if response.status_code != 204:
+            raise GoProtocolError("删除 Go 会话返回了错误状态")
+
     @staticmethod
     def _validate_capabilities(data: dict[str, Any], options: ClientOptions) -> None:
+        if set(data) != {"protocol_version", "server_version", "max_body_bytes", "tls_fingerprints"}:
+            raise GoProtocolError("capabilities 包含非法字段")
         if type(data.get("protocol_version")) is not int or data["protocol_version"] != 1:
             raise GoProtocolError("Go 服务不支持控制协议 v1")
+        if not isinstance(data["server_version"], str) or not data["server_version"]:
+            raise GoProtocolError("capabilities 缺少合法 server_version")
+        if type(data["max_body_bytes"]) is not int or data["max_body_bytes"] <= 0:
+            raise GoProtocolError("capabilities 缺少合法 max_body_bytes")
         fingerprints = data.get("tls_fingerprints")
         if not isinstance(fingerprints, list) or not all(isinstance(item, str) for item in fingerprints):
             raise GoProtocolError("capabilities 缺少合法 tls_fingerprints")
+        available = set(fingerprints)
+        if len(available) != len(fingerprints) or not {item.value for item in TLSFingerprint}.issubset(available):
+            raise GoProtocolError("capabilities 的 tls_fingerprints 与 SDK 不兼容")
         fingerprint = options.tls_fingerprint
         if fingerprint is not None and _wire(fingerprint) not in fingerprints:
             raise GoProtocolError(f"Go 服务不支持 TLS 指纹 {_wire(fingerprint)!r}")
@@ -407,7 +454,7 @@ class _GoTransport(httpx.BaseTransport):
             "elapsed_ms",
             "trace",
         }
-        if not required.issubset(data) or "error" in data:
+        if not required.issubset(data) or set(data) - required - {"dump"} or "error" in data:
             raise GoProtocolError("Go 请求响应缺少必需字段", request=request)
         if type(data["protocol_version"]) is not int or data["protocol_version"] != 1:
             raise GoProtocolError("Go 请求响应的 protocol_version 非 v1", request=request)
@@ -435,9 +482,17 @@ class _GoTransport(httpx.BaseTransport):
             for pair in data["headers"]:
                 if not isinstance(pair, list) or len(pair) != 2 or not all(isinstance(item, str) for item in pair):
                     raise ValueError
-                raw_headers.append((pair[0].encode("ascii"), pair[1].encode("latin-1")))
+                name = pair[0].encode("ascii")
+                value = pair[1].encode("latin-1")
+                if not name or any(byte not in _HTTP_TOKEN_BYTES for byte in name):
+                    raise ValueError
+                if any((byte < 32 and byte != 9) or byte == 127 for byte in value):
+                    raise ValueError
+                raw_headers.append((name, value))
             body = base64.b64decode(data["body_base64"], validate=True)
             reason_bytes = reason.encode("latin-1")
+            if any((byte < 32 and byte != 9) or byte == 127 for byte in reason_bytes):
+                raise ValueError
         except (UnicodeEncodeError, ValueError, TypeError) as exc:
             raise GoProtocolError("Go 请求响应的 header、正文或 reason 非法", request=request) from exc
 
@@ -496,17 +551,7 @@ class _GoTransport(httpx.BaseTransport):
         error = None
         try:
             if client_id is not None:
-                try:
-                    response = self._control.delete(
-                        self._endpoint + f"/api/v1/clients/{quote(client_id, safe='')}"
-                    )
-                    if response.status_code >= 400:
-                        _raise_control_error(_decode_json(response, None), None)
-                    if response.status_code != 204:
-                        raise GoProtocolError("删除 Go 会话返回了错误状态")
-                except httpx.TransportError as exc:
-                    error = GoServiceUnavailable("删除 Go 会话时无法连接本地服务")
-                    error.__cause__ = exc
+                self._delete_session()
         except BaseException as exc:
             error = exc
         finally:
@@ -542,12 +587,12 @@ class Client(httpx.Client):
         event_hooks: Mapping[str, list[Any]] | None = None,
         base_url: httpx.URL | str = "",
         default_encoding: str | Any = "utf-8",
-        transport: httpx.BaseTransport | None = None,
-        mounts: Mapping[str, httpx.BaseTransport | None] | None = None,
+        transport: httpx.BaseTransport | None | object = _UNSET,
+        mounts: Mapping[str, httpx.BaseTransport | None] | None | object = _UNSET,
     ) -> None:
-        if transport is not None:
+        if transport is not _UNSET:
             raise TypeError("Client 不允许传入 transport")
-        if mounts is not None:
+        if mounts is not _UNSET:
             raise TypeError("Client 不允许传入 mounts")
         if client_options is not None and not isinstance(client_options, ClientOptions):
             raise TypeError("client_options 必须是 ClientOptions")

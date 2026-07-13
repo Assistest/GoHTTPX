@@ -85,9 +85,12 @@ class FakeGo:
         self.capabilities_response = None
         self.create_response = None
         self.request_response = None
+        self.delete_response = None
+        self.enforce_http3_create = False
         self.request_started = threading.Event()
         self.release_request = threading.Event()
         self.block_requests = False
+        self.block_delete = False
 
 
 class FakeGoHandler(BaseHTTPRequestHandler):
@@ -120,7 +123,10 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except ConnectionError:
+            pass
 
     def _json(self, status, payload, content_type="application/json; charset=utf-8"):
         self._send(
@@ -156,6 +162,30 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             payload = None
         self._record(payload)
         if self.path == "/api/v1/clients":
+            if self.state.enforce_http3_create and payload.get("http_version") == "http3":
+                transport = payload.get("transport", {})
+                unsupported = (
+                    "response_header_timeout_ms",
+                    "expect_continue_timeout_ms",
+                    "max_idle_conns",
+                    "max_idle_conns_per_host",
+                    "max_conns_per_host",
+                    "read_buffer_size",
+                    "write_buffer_size",
+                    "proxy_connect_headers",
+                )
+                if "tls_fingerprint" in payload or any(transport.get(name) for name in unsupported):
+                    self._json(
+                        400,
+                        {
+                            "error": {
+                                "code": "INVALID_REQUEST",
+                                "message": "invalid HTTP/3 configuration",
+                                "retryable": False,
+                            }
+                        },
+                    )
+                    return
             if self.state.create_response is not None:
                 status, raw, content_type = self.state.create_response
                 self._send(status, raw, content_type)
@@ -233,6 +263,12 @@ class FakeGoHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._record()
+        if self.state.block_delete:
+            self.state.release_request.wait(2)
+        if self.state.delete_response is not None:
+            status, raw, content_type = self.state.delete_response
+            self._send(status, raw, content_type)
+            return
         self._send(204, b"", None)
 
 
@@ -320,6 +356,30 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(create["retry"]["status_codes"], [503])
         self.assertEqual(create["transport"]["proxy_connect_headers"], {"X-Proxy": ["a", "b"]})
         self.assertEqual(create["http2"]["priority_frames"][0]["priority"]["weight"], 7)
+
+    def test_http3_default_omits_fingerprint_and_unsupported_transport_defaults(self):
+        self.state.enforce_http3_create = True
+        with Client(
+            go_endpoint=self.endpoint,
+            client_options=ClientOptions(http_version="http3"),
+        ):
+            pass
+        create = self.state.calls[1]["payload"]
+        self.assertNotIn("tls_fingerprint", create)
+        self.assertFalse(create["transport"]["expect_continue_timeout_ms"])
+        self.assertFalse(create["transport"]["max_idle_conns"])
+
+        self.state.calls.clear()
+        with self.assertRaises(GoProtocolError) as caught:
+            Client(
+                go_endpoint=self.endpoint,
+                client_options=ClientOptions(
+                    http_version="http3",
+                    tls_fingerprint=TLSFingerprint.ANDROID_11_OKHTTP,
+                ),
+            )
+        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+        self.assertIn("tls_fingerprint", self.state.calls[1]["payload"])
 
     def test_prepared_json_data_files_and_content_are_forwarded_as_bytes(self):
         with Client(go_endpoint=self.endpoint) as client:
@@ -441,8 +501,10 @@ class ClientTests(unittest.TestCase):
             (200, {"protocol_version": 1, "request_id": "x", "status_code": 200, "reason_phrase": "OK", "headers": [], "body_base64": "***", "url": "https://target.test/a", "http_version": "HTTP/1.1", "elapsed_ms": 1, "trace": None}, "application/json"),
             (200, {"protocol_version": 1, "request_id": "x", "status_code": 200, "reason_phrase": "OK", "headers": [], "body_base64": "", "url": "https://target.test/a", "http_version": [], "elapsed_ms": 1, "trace": None}, "application/json"),
             (200, {"protocol_version": True, "request_id": "x", "status_code": 200, "reason_phrase": "OK", "headers": [], "body_base64": "", "url": "https://target.test/a", "http_version": "HTTP/1.1", "elapsed_ms": 1, "trace": None}, "application/json"),
+            (200, {"protocol_version": 1, "request_id": "x", "status_code": 200, "reason_phrase": "OK", "headers": [], "body_base64": "", "url": "https://target.test/a", "http_version": "HTTP/1.1", "elapsed_ms": 1, "trace": None, "extra": True}, "application/json"),
             (200, {}, "text/plain"),
         ]
+        service_error = None
         for status, payload, content_type in cases:
             with self.subTest(payload=payload, content_type=content_type):
                 self.state.request_response = (
@@ -454,8 +516,60 @@ class ClientTests(unittest.TestCase):
                     with self.assertRaises(GoProtocolError) as caught:
                         client.get("https://target.test/a")
                 self.assertIsNotNone(caught.exception.request)
-        error = cases[0][1]["error"]
-        self.assertEqual(error["code"], "INVALID_REQUEST")
+                if status == 400:
+                    service_error = caught.exception
+        self.assertEqual(service_error.code, "INVALID_REQUEST")
+        self.assertEqual(service_error.request_id, "req-e")
+        self.assertEqual(service_error.request.url, httpx.URL("https://target.test/a"))
+
+    def test_response_headers_and_reason_reject_protocol_injection(self):
+        envelope = {
+            "protocol_version": 1,
+            "request_id": "req-injection",
+            "status_code": 200,
+            "reason_phrase": "OK",
+            "headers": [["X-Test", "safe"]],
+            "body_base64": "",
+            "url": "https://target.test/a",
+            "http_version": "HTTP/1.1",
+            "elapsed_ms": 1,
+            "trace": None,
+            "dump": None,
+        }
+        mutations = [
+            ("headers", [["Bad Name", "value"]]),
+            ("headers", [["X-Test", "value\r\nInjected: yes"]]),
+            ("headers", [["X-Test", "value\x00tail"]]),
+            ("headers", [["X-Test", "value\x1ftail"]]),
+            ("reason_phrase", "OK\r\nInjected"),
+            ("reason_phrase", "OK\x7ftail"),
+        ]
+        for field, value in mutations:
+            with self.subTest(field=field, value=value):
+                invalid = dict(envelope)
+                invalid[field] = value
+                self.state.request_response = (
+                    200,
+                    json.dumps(invalid).encode(),
+                    "application/json",
+                )
+                with Client(go_endpoint=self.endpoint) as client:
+                    with self.assertRaises(GoProtocolError) as caught:
+                        client.get("https://target.test/a")
+                self.assertEqual(caught.exception.request.url, httpx.URL("https://target.test/a"))
+
+        valid = dict(envelope)
+        valid["headers"] = [["X-Test", "\t\xff"]]
+        valid["reason_phrase"] = "\t\xff"
+        self.state.request_response = (
+            200,
+            json.dumps(valid).encode(),
+            "application/json",
+        )
+        with Client(go_endpoint=self.endpoint) as client:
+            response = client.get("https://target.test/a")
+        self.assertEqual(response.headers.raw[0], (b"X-Test", b"\t\xff"))
+        self.assertEqual(response.extensions["reason_phrase"], b"\t\xff")
 
     def test_capability_and_create_failures_are_strict_and_cleanup_control_client(self):
         self.state.capabilities_response = (200, b'{"protocol_version":2}', "application/json")
@@ -475,6 +589,87 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "UNAUTHORIZED")
         with self.assertRaises(RuntimeError):
             _ = caught.exception.request
+
+    def test_capabilities_require_exact_valid_compatible_fields(self):
+        valid = {
+            "protocol_version": 1,
+            "server_version": "1.0.0",
+            "max_body_bytes": 48 << 20,
+            "tls_fingerprints": FINGERPRINTS,
+        }
+        invalid_capabilities = [
+            {**valid, "extra": True},
+            {**valid, "server_version": ""},
+            {**valid, "server_version": 1},
+            {**valid, "max_body_bytes": True},
+            {**valid, "max_body_bytes": 0},
+            {**valid, "tls_fingerprints": FINGERPRINTS + [FINGERPRINTS[0]]},
+            {**valid, "tls_fingerprints": FINGERPRINTS[:-1]},
+        ]
+        for capabilities in invalid_capabilities:
+            with self.subTest(capabilities=capabilities):
+                self.state.calls.clear()
+                self.state.capabilities_response = (
+                    200,
+                    json.dumps(capabilities).encode(),
+                    "application/json",
+                )
+                with self.assertRaises(GoProtocolError):
+                    Client(go_endpoint=self.endpoint)
+                self.assertEqual(
+                    [(call["method"], call["path"]) for call in self.state.calls],
+                    [("GET", "/api/v1/capabilities")],
+                )
+
+    def test_invalid_create_success_with_client_id_is_deleted_without_masking_error(self):
+        invalid_envelopes = [
+            {
+                "protocol_version": 2,
+                "client_id": "client-1",
+                "expires_at": "2026-07-14T00:00:00Z",
+            },
+            {
+                "protocol_version": 1,
+                "client_id": "client-1",
+                "expires_at": 123,
+            },
+            {
+                "protocol_version": 1,
+                "client_id": "client-1",
+                "expires_at": "",
+            },
+            {
+                "protocol_version": 1,
+                "client_id": "client-1",
+                "expires_at": "not-a-time",
+            },
+            {
+                "protocol_version": 1,
+                "client_id": "client-1",
+                "expires_at": "2026-07-14T00:00:00Z",
+                "extra": True,
+            },
+        ]
+        for envelope in invalid_envelopes:
+            with self.subTest(envelope=envelope):
+                self.state.calls.clear()
+                self.state.create_response = (
+                    201,
+                    json.dumps(envelope).encode(),
+                    "application/json",
+                )
+                self.state.delete_response = (500, b"cleanup failed", "text/plain")
+                with self.assertRaises(GoProtocolError) as caught:
+                    Client(go_endpoint=self.endpoint)
+                self.assertIn("创建会话", str(caught.exception))
+                self.assertEqual(
+                    [(call["method"], call["path"]) for call in self.state.calls],
+                    [
+                        ("GET", "/api/v1/capabilities"),
+                        ("POST", "/api/v1/clients"),
+                        ("DELETE", "/api/v1/clients/client-1"),
+                    ],
+                )
 
     def test_parent_initialization_failure_deletes_created_session(self):
         with self.assertRaises(TypeError):
@@ -514,10 +709,14 @@ class ClientTests(unittest.TestCase):
 
     def test_transport_and_mounts_are_rejected(self):
         transport = httpx.MockTransport(lambda request: httpx.Response(200, request=request))
-        with self.assertRaises(TypeError):
-            Client(go_endpoint=self.endpoint, transport=transport)
-        with self.assertRaises(TypeError):
-            Client(go_endpoint=self.endpoint, mounts={})
+        for kwargs in (
+            {"transport": transport},
+            {"transport": None},
+            {"mounts": {}},
+            {"mounts": None},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(TypeError):
+                Client(go_endpoint=self.endpoint, **kwargs)
         self.assertEqual(self.state.calls, [])
 
     def test_http_version_convenience_matches_httpx_defaults(self):
@@ -555,6 +754,27 @@ class ClientTests(unittest.TestCase):
         paths = [call["path"] for call in self.state.calls]
         self.assertLess(paths.index("/api/v1/clients/client-1/requests"), paths.index("/api/v1/clients/client-1"))
         self.assertEqual(paths.count("/api/v1/clients/client-1"), 1)
+
+    def test_request_control_timeout_is_target_timeout_plus_bounded_grace(self):
+        self.state.block_requests = True
+        client = Client(go_endpoint=self.endpoint)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(GoServiceUnavailable) as caught:
+                client.get("https://target.test/slow", timeout=0.01)
+            self.assertLess(time.monotonic() - started, 1.8)
+            self.assertEqual(caught.exception.request.url, httpx.URL("https://target.test/slow"))
+        finally:
+            self.state.release_request.set()
+            client.close()
+
+    def test_close_delete_timeout_is_bounded(self):
+        client = Client(go_endpoint=self.endpoint)
+        self.state.block_delete = True
+        started = time.monotonic()
+        with self.assertRaises(GoServiceUnavailable):
+            client.close()
+        self.assertLess(time.monotonic() - started, 1.8)
 
 
 if __name__ == "__main__":
