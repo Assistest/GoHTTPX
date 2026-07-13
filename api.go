@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -29,10 +31,11 @@ import (
 )
 
 const (
-	protocolVersion = 1
-	retryNone       = "none"
-	retryFixed      = "fixed"
-	retryBackoff    = "backoff"
+	protocolVersion      = 1
+	maxClientConfigBytes = 4 << 20
+	retryNone            = "none"
+	retryFixed           = "fixed"
+	retryBackoff         = "backoff"
 )
 
 var errUnsupportedTLSFingerprint = errors.New("unsupported TLS fingerprint")
@@ -202,6 +205,9 @@ type requestOptions struct {
 }
 
 func decodeStrictJSON(data []byte, target any) error {
+	if err := rejectJSONNull(data); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -209,6 +215,37 @@ func decodeStrictJSON(data []byte, target any) error {
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return errors.New("unexpected trailing JSON value")
+	}
+	return nil
+}
+
+func rejectJSONNull(data []byte) error {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	var containsNull func(any) bool
+	containsNull = func(value any) bool {
+		switch value := value.(type) {
+		case nil:
+			return true
+		case []any:
+			for _, item := range value {
+				if containsNull(item) {
+					return true
+				}
+			}
+		case map[string]any:
+			for _, item := range value {
+				if containsNull(item) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if containsNull(value) {
+		return errors.New("null is not allowed")
 	}
 	return nil
 }
@@ -274,6 +311,9 @@ type requestEnvelope struct {
 }
 
 func (input *requestEnvelope) UnmarshalJSON(data []byte) error {
+	if err := rejectJSONNull(data); err != nil {
+		return err
+	}
 	var wire struct {
 		ProtocolVersion int               `json:"protocol_version"`
 		Method          string            `json:"method"`
@@ -397,15 +437,26 @@ func (s *server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) handleCreateClient(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxClientConfigBytes)
 	var input createClientRequest
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&input); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "INVALID_REQUEST", Message: "invalid client configuration"}})
+		message := "invalid client configuration"
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			message = fmt.Sprintf("client configuration exceeds %d bytes", maxClientConfigBytes)
+		}
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "INVALID_REQUEST", Message: message}})
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "INVALID_REQUEST", Message: "invalid client configuration"}})
+		message := "invalid client configuration"
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			message = fmt.Sprintf("client configuration exceeds %d bytes", maxClientConfigBytes)
+		}
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "INVALID_REQUEST", Message: message}})
 		return
 	}
 	if input.ProtocolVersion != protocolVersion {
@@ -817,27 +868,29 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 		client.SetCerts(certificate)
 	}
 
-	var clientHelloID utls.ClientHelloID
-	switch input.Impersonate {
-	case "chrome":
-		client.ImpersonateChrome()
-		clientHelloID = utls.HelloChrome_Auto
-	case "firefox":
-		client.ImpersonateFirefox()
-		clientHelloID = utls.HelloFirefox_Auto
-	case "safari":
-		client.ImpersonateSafari()
-		clientHelloID = utls.HelloSafari_Auto
-	default:
-		fingerprint := input.TLSFingerprint
-		if fingerprint == "" {
-			fingerprint = "android_11_okhttp"
+	if input.HTTPVersion != "http3" {
+		var clientHelloID utls.ClientHelloID
+		switch input.Impersonate {
+		case "chrome":
+			client.ImpersonateChrome()
+			clientHelloID = utls.HelloChrome_Auto
+		case "firefox":
+			client.ImpersonateFirefox()
+			clientHelloID = utls.HelloFirefox_Auto
+		case "safari":
+			client.ImpersonateSafari()
+			clientHelloID = utls.HelloSafari_Auto
+		default:
+			fingerprint := input.TLSFingerprint
+			if fingerprint == "" {
+				fingerprint = "android_11_okhttp"
+			}
+			clientHelloID = fingerprints[fingerprint]
+			client.SetTLSFingerprint(clientHelloID)
 		}
-		clientHelloID = fingerprints[fingerprint]
-		client.SetTLSFingerprint(clientHelloID)
-	}
-	if input.ClientCertPEM != "" {
-		setClientCertificateTLSHandshake(client, clientHelloID)
+		if input.ClientCertPEM != "" {
+			setClientCertificateTLSHandshake(client, clientHelloID)
+		}
 	}
 	if input.ProxyURL != "" {
 		client.SetProxyURL(input.ProxyURL)
@@ -1075,8 +1128,10 @@ func validateClientConfig(input createClientRequest) error {
 			return errors.New("invalid proxy URL")
 		}
 	}
-	if input.RootCAPEM != "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(input.RootCAPEM)) {
-		return errors.New("invalid root CA PEM")
+	if input.RootCAPEM != "" {
+		if err := validateRootCAPEM(input.RootCAPEM); err != nil {
+			return err
+		}
 	}
 	if (input.ClientCertPEM == "") != (input.ClientKeyPEM == "") {
 		return errors.New("client certificate and key must be provided together")
@@ -1093,6 +1148,15 @@ func validateClientConfig(input createClientRequest) error {
 	if httpVersion != "auto" && httpVersion != "http1" && httpVersion != "http2" && httpVersion != "http3" && httpVersion != "h2c" {
 		return fmt.Errorf("invalid HTTP version %q", input.HTTPVersion)
 	}
+	if input.ProxyURL != "" && (httpVersion == "http2" || httpVersion == "http3") {
+		return errors.New("proxy URL cannot be combined with forced HTTP/2 or HTTP/3")
+	}
+	if httpVersion == "http3" && (input.tlsFingerprintSet || input.TLSFingerprint != "" && input.TLSFingerprint != "android_11_okhttp" || impersonate != "none" || input.ClientCertPEM != "") {
+		return errors.New("HTTP/3 cannot be combined with TLS fingerprint, impersonate, or client certificate")
+	}
+	if httpVersion == "http3" {
+		return fmt.Errorf("HTTP/3 is unavailable with req/v3 v3.48.0 on %s", runtime.Version())
+	}
 	if err := validateTransportConfig(input.Transport); err != nil {
 		return err
 	}
@@ -1100,6 +1164,27 @@ func validateClientConfig(input createClientRequest) error {
 		return err
 	}
 	return validateRetryConfig(input.Retry)
+}
+
+func validateRootCAPEM(content string) error {
+	remaining := bytes.TrimSpace([]byte(content))
+	if len(remaining) == 0 {
+		return errors.New("invalid root CA PEM")
+	}
+	for len(remaining) > 0 {
+		if !bytes.HasPrefix(remaining, []byte("-----BEGIN CERTIFICATE-----")) {
+			return errors.New("invalid root CA PEM")
+		}
+		block, rest := pem.Decode(remaining)
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return errors.New("invalid root CA PEM")
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return errors.New("invalid root CA PEM")
+		}
+		remaining = bytes.TrimSpace(rest)
+	}
+	return nil
 }
 
 func validateTransportConfig(input transportConfig) error {

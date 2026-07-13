@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -292,6 +293,9 @@ func addTestClient(t *testing.T, s *server) string {
 
 func sendRawRequest(t *testing.T, handler http.Handler, clientID string, input requestEnvelope) *httptest.ResponseRecorder {
 	t.Helper()
+	if input.Headers == nil {
+		input.Headers = [][2]string{}
+	}
 	body, err := json.Marshal(input)
 	if err != nil {
 		t.Fatal(err)
@@ -616,7 +620,7 @@ func TestRawRequestTracksActiveCalls(t *testing.T) {
 	s.clients[clientID].lastUsed = time.Now().Add(-time.Hour)
 	previousLastUsed := s.clients[clientID].lastUsed
 	s.clients[clientID].mu.Unlock()
-	body, err := json.Marshal(requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: target.URL})
+	body, err := json.Marshal(requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: target.URL, Headers: [][2]string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -790,17 +794,23 @@ func TestClientOptionsValidateBoundaries(t *testing.T) {
 		{name: "client certificate PEM", input: createClientRequest{ClientCertPEM: "bad", ClientKeyPEM: "bad"}},
 		{name: "HTTP version", input: createClientRequest{HTTPVersion: "http4"}},
 		{name: "retry count", input: createClientRequest{Retry: retryConfig{Count: 11, Mode: retryNone}}},
+		{name: "retry count negative", input: createClientRequest{Retry: retryConfig{Count: -1, Mode: retryNone}}},
 		{name: "retry zero fixed", input: createClientRequest{Retry: retryConfig{Mode: retryFixed, FixedIntervalMS: 1}}},
 		{name: "retry fixed interval", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryFixed}}},
 		{name: "retry backoff order", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryBackoff, BackoffMinMS: 2, BackoffMaxMS: 1}}},
 		{name: "retry status", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{99}}}},
+		{name: "retry status large", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{600}}}},
 		{name: "duplicate retry status", input: createClientRequest{Retry: retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{500, 500}}}},
 		{name: "duration negative", input: createClientRequest{Transport: transportConfig{TLSHandshakeTimeoutMS: -1}}},
 		{name: "duration large", input: createClientRequest{HTTP2: http2Config{PingTimeoutMS: 600001}}},
 		{name: "connection large", input: createClientRequest{Transport: transportConfig{MaxIdleConns: 100001}}},
+		{name: "connection negative", input: createClientRequest{Transport: transportConfig{MaxConnsPerHost: -1}}},
 		{name: "buffer large", input: createClientRequest{Transport: transportConfig{ReadBufferSize: 16777217}}},
+		{name: "buffer negative", input: createClientRequest{Transport: transportConfig{WriteBufferSize: -1}}},
 		{name: "response header large", input: createClientRequest{Transport: transportConfig{MaxResponseHeaderBytes: 16777217}}},
+		{name: "response header negative", input: createClientRequest{Transport: transportConfig{MaxResponseHeaderBytes: -1}}},
 		{name: "setting ID", input: createClientRequest{HTTP2: http2Config{Settings: []http2Setting{{ID: 7}}}}},
+		{name: "setting ID zero", input: createClientRequest{HTTP2: http2Config{Settings: []http2Setting{{ID: 0}}}}},
 		{name: "duplicate setting", input: createClientRequest{HTTP2: http2Config{Settings: []http2Setting{{ID: 1}, {ID: 1}}}}},
 		{name: "priority dependency", input: createClientRequest{HTTP2: http2Config{HeaderPriority: &priorityParam{StreamDependency: 1 << 31}}}},
 		{name: "priority weight", input: createClientRequest{HTTP2: http2Config{HeaderPriority: &priorityParam{Weight: 256}}}},
@@ -816,8 +826,32 @@ func TestClientOptionsValidateBoundaries(t *testing.T) {
 	}
 }
 
+func TestClientOptionsAcceptExactBoundaries(t *testing.T) {
+	connectionFlow := uint32(0xffffffff)
+	maxHeaderListSize := uint32(0xffffffff)
+	_, err := buildReqClient(createClientRequest{
+		Retry: retryConfig{Count: 10, Mode: retryBackoff, BackoffMinMS: 1, BackoffMaxMS: 600000, StatusCodes: []int{100, 599}},
+		Transport: transportConfig{
+			TLSHandshakeTimeoutMS: 600000, ResponseHeaderTimeoutMS: 600000, ExpectContinueTimeoutMS: 600000, IdleConnTimeoutMS: 600000,
+			MaxIdleConns: 100000, MaxIdleConnsPerHost: 100000, MaxConnsPerHost: 100000,
+			MaxResponseHeaderBytes: 16777216, ReadBufferSize: 16777216, WriteBufferSize: 16777216,
+		},
+		HTTP2: http2Config{
+			Settings:          []http2Setting{{ID: 1, Value: 0xffffffff}, {ID: 6, Value: 0xffffffff}},
+			ConnectionFlow:    &connectionFlow,
+			HeaderPriority:    &priorityParam{StreamDependency: math.MaxInt32, Weight: math.MaxUint8},
+			PriorityFrames:    []priorityFrame{{StreamID: math.MaxInt32, Priority: priorityParam{StreamDependency: math.MaxInt32, Weight: math.MaxUint8}}},
+			MaxHeaderListSize: &maxHeaderListSize,
+			ReadIdleTimeoutMS: 600000, PingTimeoutMS: 600000, WriteByteTimeoutMS: 600000,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientOptionsHTTPVersions(t *testing.T) {
-	for _, version := range []string{"auto", "http1", "http2", "http3", "h2c"} {
+	for _, version := range []string{"auto", "http1", "http2", "h2c"} {
 		t.Run(version, func(t *testing.T) {
 			client, err := buildReqClient(createClientRequest{HTTPVersion: version})
 			if err != nil {
@@ -827,6 +861,76 @@ func TestClientOptionsHTTPVersions(t *testing.T) {
 				t.Fatalf("EnableH2C = %t", got)
 			}
 		})
+	}
+}
+
+func TestClientOptionsRejectUnsupportedHTTP3(t *testing.T) {
+	if _, err := buildReqClient(createClientRequest{HTTPVersion: "http3"}); err == nil || !strings.Contains(err.Error(), "HTTP/3 is unavailable") {
+		t.Fatalf("error = %v", err)
+	}
+	s := newServer("", 48<<20, time.Hour)
+	response := httptest.NewRecorder()
+	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3"}`)))
+	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "HTTP/3 is unavailable") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestClientOptionsRejectUnsafeProtocolCombinations(t *testing.T) {
+	for _, input := range []createClientRequest{
+		{HTTPVersion: "http2", ProxyURL: "http://127.0.0.1:8080"},
+		{HTTPVersion: "http3", ProxyURL: "http://127.0.0.1:8080"},
+		{HTTPVersion: "http3", TLSFingerprint: "chrome_120"},
+		{HTTPVersion: "http3", Impersonate: "chrome"},
+		{HTTPVersion: "http3", ClientCertPEM: "certificate", ClientKeyPEM: "key"},
+	} {
+		if _, err := buildReqClient(input); err == nil {
+			t.Fatalf("unsafe combination accepted: %#v", input)
+		}
+	}
+}
+
+func TestClientOptionsCreateLimit(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	response := httptest.NewRecorder()
+	body := `{"protocol_version":1,"root_ca_pem":"` + strings.Repeat("a", 4<<20) + `"}`
+	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(body)))
+	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "4194304") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(s.clients) != 0 {
+		t.Fatal("oversized configuration entered registry")
+	}
+}
+
+func TestClientOptionsRejectNullAndInvalidRootCAPEM(t *testing.T) {
+	_, validCA, _ := newTestCA(t, "strict PEM CA")
+	for _, rootCA := range []string{"   ", "garbage" + validCA, validCA + "garbage", strings.Replace(validCA, "CERTIFICATE", "PRIVATE KEY", 2), validCA + "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n"} {
+		if _, err := buildReqClient(createClientRequest{RootCAPEM: rootCA}); err == nil {
+			t.Fatalf("invalid root CA accepted: %q", rootCA)
+		}
+	}
+	if _, err := buildReqClient(createClientRequest{RootCAPEM: validCA}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, body := range []string{
+		`{"protocol_version":null}`,
+		`{"protocol_version":1,"verify":null}`,
+		`{"protocol_version":1,"tls_fingerprint":null}`,
+		`{"protocol_version":1,"retry":null}`,
+		`{"protocol_version":1,"retry":{"status_codes":null}}`,
+		`{"protocol_version":1,"retry":{"status_codes":[500,null]}}`,
+		`{"protocol_version":1,"transport":{"proxy_connect_headers":{"X-Test":null}}}`,
+		`{"protocol_version":1,"http2":{"settings":[null]}}`,
+		`{"protocol_version":1,"http2":{"header_priority":null}}`,
+	} {
+		s := newServer("", 48<<20, time.Hour)
+		response := httptest.NewRecorder()
+		s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(body)))
+		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
+			t.Fatalf("null accepted: %s response=%s", body, response.Body.String())
+		}
 	}
 }
 
@@ -1003,38 +1107,18 @@ func TestClientOptionsFingerprintWithMTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodConnect {
-			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
-			return
-		}
-		upstream, err := net.Dial("tcp", r.Host)
+	for _, proxyTLS := range []*tls.Config{nil, {Certificates: []tls.Certificate{serverCertificate}}} {
+		proxy := newTestConnectProxy(t, proxyTLS)
+		proxiedClient, err := buildReqClient(createClientRequest{TLSFingerprint: "chrome_120", ProxyURL: proxy.URL, RootCAPEM: trustedCAPEM, ClientCertPEM: clientCertPEM, ClientKeyPEM: clientKeyPEM})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
+			t.Fatal(err)
 		}
-		downstream, buffered, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			upstream.Close()
-			return
+		proxiedResponse, err := proxiedClient.R().Get(target.URL)
+		proxiedClient.GetTransport().CloseIdleConnections()
+		proxy.Close()
+		if err != nil || proxiedResponse.StatusCode != http.StatusNoContent {
+			t.Fatalf("proxy=%s response=%v err=%v", proxy.URL, proxiedResponse, err)
 		}
-		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
-		_ = buffered.Flush()
-		go func() {
-			_, _ = io.Copy(upstream, downstream)
-			_ = upstream.Close()
-		}()
-		_, _ = io.Copy(downstream, upstream)
-		_ = downstream.Close()
-	}))
-	proxiedClient, err := buildReqClient(createClientRequest{TLSFingerprint: "chrome_120", ProxyURL: proxy.URL, RootCAPEM: trustedCAPEM, ClientCertPEM: clientCertPEM, ClientKeyPEM: clientKeyPEM})
-	if err != nil {
-		t.Fatal(err)
-	}
-	proxiedResponse, err := proxiedClient.R().Get(target.URL)
-	proxy.Close()
-	if err != nil || proxiedResponse.StatusCode != http.StatusNoContent {
-		t.Fatalf("proxied response=%v err=%v", proxiedResponse, err)
 	}
 
 	failures := []createClientRequest{
@@ -1062,6 +1146,41 @@ func TestClientOptionsFingerprintWithMTLS(t *testing.T) {
 	if response.Code != http.StatusBadGateway || decodeAPIError(t, response).Code != "UPSTREAM_TLS_ERROR" {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
+}
+
+func newTestConnectProxy(t *testing.T, tlsConfig *tls.Config) *httptest.Server {
+	t.Helper()
+	proxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		upstream, err := net.Dial("tcp", r.Host)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		downstream, buffered, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			upstream.Close()
+			return
+		}
+		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buffered.Flush()
+		go func() {
+			_, _ = io.Copy(upstream, downstream)
+			_ = upstream.Close()
+		}()
+		_, _ = io.Copy(downstream, upstream)
+		_ = downstream.Close()
+	}))
+	if tlsConfig == nil {
+		proxy.Start()
+	} else {
+		proxy.TLS = tlsConfig
+		proxy.StartTLS()
+	}
+	return proxy
 }
 
 func newTestCA(t *testing.T, commonName string) (*x509.Certificate, string, *ecdsa.PrivateKey) {
