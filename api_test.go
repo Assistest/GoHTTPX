@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -261,5 +266,351 @@ func TestIdleCleanupKeepsActiveAndRecentClients(t *testing.T) {
 	}
 	if s.clients["active"] == nil || s.clients["recent"] == nil {
 		t.Fatalf("remaining clients = %#v", s.clients)
+	}
+}
+
+func addTestClient(t *testing.T, s *server) string {
+	t.Helper()
+	client, err := buildReqClient(createClientRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientID = "test-client"
+	s.mu.Lock()
+	s.clients[clientID] = &clientSession{client: client, lastUsed: time.Now()}
+	s.mu.Unlock()
+	return clientID
+}
+
+func sendRawRequest(t *testing.T, handler http.Handler, clientID string, input requestEnvelope) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", bytes.NewReader(body)))
+	return response
+}
+
+func decodeAPIError(t *testing.T, response *httptest.ResponseRecorder) apiError {
+	t.Helper()
+	var result errorResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	return result.Error
+}
+
+func TestRawRequestPreservesDuplicateHeadersAndBinaryBodies(t *testing.T) {
+	var method string
+	var duplicateHeaders []string
+	var requestBody []byte
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		duplicateHeaders = r.Header.Values("X-Dupe")
+		requestBody, _ = io.ReadAll(r.Body)
+		w.Header().Add("Set-Cookie", "a=1")
+		w.Header().Add("Set-Cookie", "b=2")
+		w.Header().Set("X-Latin-1", string([]byte{0xff}))
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte{3, 2, 1, 0xff})
+	}))
+	defer target.Close()
+
+	s := newServer("", 48<<20, time.Hour)
+	clientID := addTestClient(t, s)
+	response := sendRawRequest(t, s.routes(), clientID, requestEnvelope{
+		ProtocolVersion: protocolVersion,
+		Method:          http.MethodPost,
+		URL:             target.URL + "/raw",
+		Headers:         [][2]string{{"X-Dupe", "first"}, {"X-Dupe", "\u00ff"}},
+		BodyBase64:      base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 0xff}),
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("control status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if method != http.MethodPost || !reflect.DeepEqual(duplicateHeaders, []string{"first", string([]byte{0xff})}) || !bytes.Equal(requestBody, []byte{0, 1, 2, 0xff}) {
+		t.Fatalf("target request method=%q headers=%q body=%x", method, duplicateHeaders, requestBody)
+	}
+
+	var result responseEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	decodedBody, err := base64.StdEncoding.DecodeString(result.BodyBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProtocolVersion != protocolVersion || result.RequestID == "" || result.StatusCode != http.StatusCreated || result.ReasonPhrase != "Created" || result.URL != target.URL+"/raw" || result.HTTPVersion == "" || !bytes.Equal(decodedBody, []byte{3, 2, 1, 0xff}) {
+		t.Fatalf("response envelope = %#v, body=%x", result, decodedBody)
+	}
+	var cookies []string
+	latin1 := ""
+	for _, pair := range result.Headers {
+		switch pair[0] {
+		case "Set-Cookie":
+			cookies = append(cookies, pair[1])
+		case "X-Latin-1":
+			latin1 = pair[1]
+		}
+	}
+	if !reflect.DeepEqual(cookies, []string{"a=1", "b=2"}) || latin1 != "\u00ff" {
+		t.Fatalf("response headers = %#v", result.Headers)
+	}
+}
+
+func TestAllMethods(t *testing.T) {
+	var gotMethod string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	s := newServer("", 48<<20, time.Hour)
+	clientID := addTestClient(t, s)
+
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions, "PURGE"} {
+		t.Run(method, func(t *testing.T) {
+			response := sendRawRequest(t, s.routes(), clientID, requestEnvelope{ProtocolVersion: protocolVersion, Method: method, URL: target.URL})
+			if response.Code != http.StatusOK || gotMethod != method {
+				t.Fatalf("control status=%d target method=%q body=%s", response.Code, gotMethod, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestUpstreamHTTPErrorIsAResponse(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "failed", http.StatusInternalServerError)
+	}))
+	defer target.Close()
+	s := newServer("", 48<<20, time.Hour)
+	response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: target.URL})
+	if response.Code != http.StatusOK {
+		t.Fatalf("control status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var result responseEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("upstream status = %d", result.StatusCode)
+	}
+}
+
+func TestRawRequestTrace(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+	s := newServer("", 48<<20, time.Hour)
+	response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{
+		ProtocolVersion: protocolVersion,
+		Method:          http.MethodGet,
+		URL:             target.URL,
+		Options:         requestOptions{Trace: true},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("control status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var result responseEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace == nil || result.Trace.RemoteAddress == "" || result.Trace.TotalMS < 0 {
+		t.Fatalf("trace = %#v", result.Trace)
+	}
+}
+
+func TestRequestValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		edit func(*requestEnvelope)
+	}{
+		{name: "protocol", code: "PROTOCOL_MISMATCH", edit: func(input *requestEnvelope) { input.ProtocolVersion = 2 }},
+		{name: "empty method", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.Method = "" }},
+		{name: "invalid method", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.Method = "BAD METHOD" }},
+		{name: "long method", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.Method = strings.Repeat("A", 65) }},
+		{name: "relative URL", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.URL = "/relative" }},
+		{name: "unsupported URL scheme", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.URL = "ftp://example.com/file" }},
+		{name: "long URL", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.URL = "http://example.com/" + strings.Repeat("a", 16384) }},
+		{name: "too many headers", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) {
+			input.Headers = make([][2]string, 257)
+			for i := range input.Headers {
+				input.Headers[i] = [2]string{"X-Test", "a"}
+			}
+		}},
+		{name: "invalid header name", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.Headers = [][2]string{{"Bad Name", "a"}} }},
+		{name: "long header name", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.Headers = [][2]string{{strings.Repeat("A", 257), "a"}} }},
+		{name: "invalid header value", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.Headers = [][2]string{{"X-Test", "a\nb"}} }},
+		{name: "non latin-1 header", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.Headers = [][2]string{{"X-Test", "中文"}} }},
+		{name: "long header value", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.Headers = [][2]string{{"X-Test", strings.Repeat("a", 16385)}} }},
+		{name: "large total headers", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) {
+			input.Headers = make([][2]string, 65)
+			for i := range input.Headers {
+				input.Headers[i] = [2]string{"X-Test", strings.Repeat("a", 16384)}
+			}
+		}},
+		{name: "invalid base64", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.BodyBase64 = "%%%" }},
+		{name: "large body", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.BodyBase64 = base64.StdEncoding.EncodeToString([]byte("12345")) }},
+		{name: "negative timeout", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.TimeoutMS = -1 }},
+		{name: "large timeout", code: "INVALID_REQUEST", edit: func(input *requestEnvelope) { input.TimeoutMS = 600001 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := newServer("", 4, time.Hour)
+			clientID := addTestClient(t, s)
+			input := requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: "http://example.com"}
+			test.edit(&input)
+			response := sendRawRequest(t, s.routes(), clientID, input)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			if got := decodeAPIError(t, response).Code; got != test.code {
+				t.Fatalf("error code = %q", got)
+			}
+		})
+	}
+
+	for name, body := range map[string]string{
+		"malformed":        `{`,
+		"unknown field":    `{"protocol_version":1,"method":"GET","url":"http://example.com","unknown":true}`,
+		"unknown option":   `{"protocol_version":1,"method":"GET","url":"http://example.com","options":{"unknown":true}}`,
+		"trailing content": `{"protocol_version":1,"method":"GET","url":"http://example.com"} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newServer("", 48<<20, time.Hour)
+			clientID := addTestClient(t, s)
+			response := httptest.NewRecorder()
+			s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", strings.NewReader(body)))
+			if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestRawRequestReturnsClientNotFoundBeforeUpstream(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	response := sendRawRequest(t, s.routes(), "missing", requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: "http://127.0.0.1:1"})
+	if response.Code != http.StatusNotFound || decodeAPIError(t, response).Code != "CLIENT_NOT_FOUND" {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRawRequestTracksActiveCalls(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	s := newServer("", 48<<20, time.Hour)
+	clientID := addTestClient(t, s)
+	s.clients[clientID].mu.Lock()
+	s.clients[clientID].lastUsed = time.Now().Add(-time.Hour)
+	previousLastUsed := s.clients[clientID].lastUsed
+	s.clients[clientID].mu.Unlock()
+	body, err := json.Marshal(requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: target.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", bytes.NewReader(body)))
+		done <- response
+	}()
+	<-started
+	s.clients[clientID].mu.Lock()
+	activeCalls := s.clients[clientID].activeCalls
+	lastUsed := s.clients[clientID].lastUsed
+	s.clients[clientID].mu.Unlock()
+	if activeCalls != 1 || !lastUsed.After(previousLastUsed) {
+		t.Fatalf("active calls=%d last used=%s", activeCalls, lastUsed)
+	}
+	close(release)
+	response := <-done
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	s.clients[clientID].mu.Lock()
+	defer s.clients[clientID].mu.Unlock()
+	if s.clients[clientID].activeCalls != 0 {
+		t.Fatalf("active calls = %d", s.clients[clientID].activeCalls)
+	}
+}
+
+func TestUpstreamErrors(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(100 * time.Millisecond)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer target.Close()
+		s := newServer("", 48<<20, time.Hour)
+		response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: target.URL, TimeoutMS: 10})
+		if response.Code != http.StatusGatewayTimeout || decodeAPIError(t, response).Code != "UPSTREAM_TIMEOUT" {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("connect", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		address := listener.Addr().String()
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+		s := newServer("", 48<<20, time.Hour)
+		response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: "http://" + address})
+		if response.Code != http.StatusBadGateway || decodeAPIError(t, response).Code != "UPSTREAM_CONNECT_ERROR" {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("TLS", func(t *testing.T) {
+		target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer target.Close()
+		s := newServer("", 48<<20, time.Hour)
+		response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: target.URL})
+		if response.Code != http.StatusBadGateway || decodeAPIError(t, response).Code != "UPSTREAM_TLS_ERROR" {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("protocol", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		go func() {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			defer connection.Close()
+			_, _ = bufio.NewReader(connection).ReadString('\n')
+			_, _ = connection.Write([]byte("HTTP/1.1 invalid\r\n\r\n"))
+		}()
+		s := newServer("", 48<<20, time.Hour)
+		response := sendRawRequest(t, s.routes(), addTestClient(t, s), requestEnvelope{ProtocolVersion: protocolVersion, Method: http.MethodGet, URL: "http://" + listener.Addr().String()})
+		if response.Code != http.StatusBadGateway || decodeAPIError(t, response).Code != "UPSTREAM_PROTOCOL_ERROR" {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+	})
+
+	code, retryable := classifyUpstreamError(&neturl.Error{Err: &net.DNSError{Err: "no such host", Name: "missing.invalid"}})
+	if code != "UPSTREAM_DNS_ERROR" || !retryable {
+		t.Fatalf("DNS classification = %q, retryable=%t", code, retryable)
 	}
 }
