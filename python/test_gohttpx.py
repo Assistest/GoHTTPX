@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import os
@@ -11,6 +12,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from gohttpx import (
+    AsyncClient,
     Client,
     ClientOptions,
     GoProtocolError,
@@ -82,14 +84,25 @@ FINGERPRINTS = [
 class FakeGo:
     def __init__(self):
         self.calls = []
+        self.lock = threading.Lock()
+        self.create_count = 0
         self.capabilities_response = None
         self.create_response = None
         self.request_response = None
         self.delete_response = None
         self.enforce_http3_create = False
+        self.not_found_remaining = 0
+        self.stale_client_id = None
+        self.stale_expected = 0
+        self.stale_seen = 0
+        self.stale_ready = threading.Event()
+        self.drop_request_connection = False
         self.request_started = threading.Event()
         self.release_request = threading.Event()
+        self.create_started = threading.Event()
+        self.release_create = threading.Event()
         self.block_requests = False
+        self.block_rebuild_create = False
         self.block_delete = False
 
 
@@ -108,14 +121,15 @@ class FakeGoHandler(BaseHTTPRequestHandler):
         return self.rfile.read(size)
 
     def _record(self, payload=None):
-        self.state.calls.append(
-            {
-                "method": self.command,
-                "path": self.path,
-                "authorization": self.headers.get("authorization"),
-                "payload": payload,
-            }
-        )
+        with self.state.lock:
+            self.state.calls.append(
+                {
+                    "method": self.command,
+                    "path": self.path,
+                    "authorization": self.headers.get("authorization"),
+                    "payload": payload,
+                }
+            )
 
     def _send(self, status, body=b"", content_type="application/json; charset=utf-8"):
         self.send_response(status)
@@ -162,6 +176,12 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             payload = None
         self._record(payload)
         if self.path == "/api/v1/clients":
+            with self.state.lock:
+                self.state.create_count += 1
+                create_count = self.state.create_count
+            if self.state.block_rebuild_create and create_count > 1:
+                self.state.create_started.set()
+                self.state.release_create.wait(2)
             if self.state.enforce_http3_create and payload.get("http_version") == "http3":
                 transport = payload.get("transport", {})
                 unsupported = (
@@ -194,17 +214,38 @@ class FakeGoHandler(BaseHTTPRequestHandler):
                 201,
                 {
                     "protocol_version": 1,
-                    "client_id": "client-1",
+                    "client_id": f"client-{create_count}",
                     "expires_at": "2026-07-14T00:00:00Z",
                 },
             )
             return
-        if self.path != "/api/v1/clients/client-1/requests":
+        prefix = "/api/v1/clients/"
+        suffix = "/requests"
+        if not self.path.startswith(prefix) or not self.path.endswith(suffix):
             self._json(404, {"error": {"code": "CLIENT_NOT_FOUND", "message": "missing", "retryable": False, "request_id": "req-error"}})
             return
+        client_id = self.path[len(prefix):-len(suffix)]
         self.state.request_started.set()
         if self.state.block_requests:
             self.state.release_request.wait(2)
+        if self.state.drop_request_connection:
+            self.close_connection = True
+            return
+        if client_id == self.state.stale_client_id:
+            with self.state.lock:
+                self.state.stale_seen += 1
+                if self.state.stale_seen >= self.state.stale_expected:
+                    self.state.stale_ready.set()
+            self.state.stale_ready.wait(2)
+            self._json(404, {"error": {"code": "CLIENT_NOT_FOUND", "message": "missing", "retryable": False, "request_id": "req-stale"}})
+            return
+        with self.state.lock:
+            not_found = self.state.not_found_remaining > 0
+            if not_found:
+                self.state.not_found_remaining -= 1
+        if not_found:
+            self._json(404, {"error": {"code": "CLIENT_NOT_FOUND", "message": "missing", "retryable": False, "request_id": "req-missing"}})
+            return
         if self.state.request_response is not None:
             status, raw, content_type = self.state.request_response
             self._send(status, raw, content_type)
@@ -284,6 +325,7 @@ class ClientTests(unittest.TestCase):
 
     def tearDown(self):
         self.state.release_request.set()
+        self.state.release_create.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
@@ -808,6 +850,149 @@ class ClientTests(unittest.TestCase):
             pass
         self.assertEqual(self.state.calls[1]["payload"]["http_version"], "auto")
 
+    def test_upstream_error_codes_map_to_httpx_exceptions_with_metadata(self):
+        cases = [
+            ("UPSTREAM_TIMEOUT", httpx.TimeoutException),
+            ("UPSTREAM_DNS_ERROR", httpx.ConnectError),
+            ("UPSTREAM_CONNECT_ERROR", httpx.ConnectError),
+            ("UPSTREAM_TLS_ERROR", httpx.ConnectError),
+            ("UPSTREAM_PROTOCOL_ERROR", httpx.RemoteProtocolError),
+            ("INTERNAL_ERROR", GoProtocolError),
+            ("UNKNOWN_ERROR", GoProtocolError),
+        ]
+        for code, exception_type in cases:
+            with self.subTest(code=code):
+                self.state.request_response = (
+                    502,
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": code,
+                                "message": "upstream failed",
+                                "retryable": False,
+                                "request_id": "req-upstream",
+                            }
+                        }
+                    ).encode(),
+                    "application/json",
+                )
+                with Client(go_endpoint=self.endpoint) as client:
+                    with self.assertRaises(exception_type) as caught:
+                        client.get("https://target.test/error")
+                self.assertEqual(caught.exception.request.url, httpx.URL("https://target.test/error"))
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(caught.exception.request_id, "req-upstream")
+                self.state.calls.clear()
+
+    def test_sync_client_not_found_rebuilds_once_and_reuses_exact_post_envelope(self):
+        self.state.not_found_remaining = 1
+        with Client(go_endpoint=self.endpoint) as client:
+            response = client.post("https://target.test/post", content=b"payload")
+
+        requests = [call for call in self.state.calls if call["path"].endswith("/requests")]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([call["path"] for call in requests], [
+            "/api/v1/clients/client-1/requests",
+            "/api/v1/clients/client-2/requests",
+        ])
+        self.assertEqual(requests[0]["payload"], requests[1]["payload"])
+        self.assertEqual(sum(call["path"] == "/api/v1/clients" for call in self.state.calls), 2)
+        self.assertEqual(sum(call["path"] == "/api/v1/capabilities" for call in self.state.calls), 1)
+
+    def test_sync_concurrent_client_not_found_rebuild_is_single_flight(self):
+        client = Client(go_endpoint=self.endpoint)
+        self.state.stale_client_id = "client-1"
+        self.state.stale_expected = 4
+        responses = []
+        errors = []
+
+        def send(index):
+            try:
+                responses.append(client.post(f"https://target.test/{index}", content=str(index).encode()))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=send, args=(index,), daemon=True) for index in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        client.close()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(responses), 4)
+        self.assertEqual(self.state.create_count, 2)
+        request_paths = [call["path"] for call in self.state.calls if call["path"].endswith("/requests")]
+        self.assertEqual(request_paths.count("/api/v1/clients/client-1/requests"), 4)
+        self.assertEqual(request_paths.count("/api/v1/clients/client-2/requests"), 4)
+
+    def test_sync_second_client_not_found_and_rebuild_failure_do_not_loop(self):
+        self.state.not_found_remaining = 2
+        with Client(go_endpoint=self.endpoint) as client:
+            with self.assertRaises(GoProtocolError) as caught:
+                client.post("https://target.test/post", content=b"once")
+        self.assertEqual(caught.exception.code, "CLIENT_NOT_FOUND")
+        self.assertEqual(sum(call["path"].endswith("/requests") for call in self.state.calls), 2)
+        self.assertEqual(self.state.create_count, 2)
+
+        self.state = FakeGo()
+        self.server.state = self.state
+        client = Client(go_endpoint=self.endpoint)
+        self.state.not_found_remaining = 1
+        self.state.create_response = (
+            500,
+            b'{"error":{"code":"INTERNAL_ERROR","message":"create failed","retryable":false}}',
+            "application/json",
+        )
+        with self.assertRaises(GoProtocolError) as caught:
+            client.get("https://target.test/a")
+        client.close()
+        self.assertEqual(caught.exception.code, "INTERNAL_ERROR")
+        self.assertEqual(caught.exception.request.url, httpx.URL("https://target.test/a"))
+        self.assertEqual(sum(call["path"].endswith("/requests") for call in self.state.calls), 1)
+        self.assertEqual(self.state.create_count, 2)
+
+    def test_sync_control_disconnect_does_not_retry_post(self):
+        client = Client(go_endpoint=self.endpoint)
+        self.state.drop_request_connection = True
+        with self.assertRaises(GoServiceUnavailable):
+            client.post("https://target.test/post", content=b"unsafe")
+        self.state.drop_request_connection = False
+        client.close()
+        self.assertEqual(sum(call["path"].endswith("/requests") for call in self.state.calls), 1)
+        self.assertEqual(self.state.create_count, 1)
+
+    def test_sync_concurrent_rebuild_failure_is_single_flight_and_keeps_each_request(self):
+        client = Client(go_endpoint=self.endpoint)
+        self.state.stale_client_id = "client-1"
+        self.state.stale_expected = 2
+        self.state.create_response = (
+            500,
+            b'{"error":{"code":"INTERNAL_ERROR","message":"create failed","retryable":false}}',
+            "application/json",
+        )
+        errors = []
+
+        def send(index):
+            try:
+                client.get(f"https://target.test/{index}")
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=send, args=(index,), daemon=True) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        client.close()
+
+        self.assertEqual(self.state.create_count, 2)
+        self.assertEqual(len(errors), 2)
+        self.assertEqual({error.request.url for error in errors}, {
+            httpx.URL("https://target.test/0"),
+            httpx.URL("https://target.test/1"),
+        })
+
     def test_close_is_idempotent_and_waits_for_active_request(self):
         self.state.block_requests = True
         client = Client(go_endpoint=self.endpoint)
@@ -851,6 +1036,233 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(GoServiceUnavailable):
             client.close()
         self.assertLess(time.monotonic() - started, 1.8)
+
+
+class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.state = FakeGo()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeGoHandler)
+        self.server.state = self.state
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.endpoint = f"http://{host}:{port}"
+
+    def tearDown(self):
+        self.state.release_request.set()
+        self.state.release_create.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    async def test_lazy_async_post_returns_real_response_and_close_is_idempotent(self):
+        client = AsyncClient(go_endpoint=self.endpoint)
+        self.assertEqual(self.state.calls, [])
+
+        response = await client.post("https://target.test/json", json={"name": "test"})
+        await client.aclose()
+        await client.aclose()
+
+        self.assertIsInstance(response, httpx.Response)
+        self.assertEqual(response.json(), {"res": "ok"})
+        self.assertEqual(response.request.url, httpx.URL("https://target.test/json"))
+        self.assertEqual(
+            [(call["method"], call["path"]) for call in self.state.calls],
+            [
+                ("GET", "/api/v1/capabilities"),
+                ("POST", "/api/v1/clients"),
+                ("POST", "/api/v1/clients/client-1/requests"),
+                ("DELETE", "/api/v1/clients/client-1"),
+            ],
+        )
+
+    async def test_async_context_manager_without_request_creates_no_session(self):
+        async with AsyncClient(go_endpoint=self.endpoint):
+            self.assertEqual(self.state.calls, [])
+        self.assertEqual(self.state.calls, [])
+
+    async def test_async_httpx_body_cookie_header_and_redirect_semantics(self):
+        async with AsyncClient(
+            go_endpoint=self.endpoint,
+            headers={"X-Default": "one"},
+            cookies={"initial": "yes"},
+            follow_redirects=True,
+        ) as client:
+            json_response = await client.post("https://target.test/json", json={"a": 1})
+            await client.post("https://target.test/data", data={"a": "b"})
+            await client.post("https://target.test/raw", content=b"\x00raw")
+            await client.get("https://target.test/set-cookie")
+            await client.get("https://target.test/next")
+            redirected = await client.get("https://target.test/redirect")
+
+        requests = [call["payload"] for call in self.state.calls if call["path"].endswith("/requests")]
+        self.assertEqual(json_response.json(), {"res": "ok"})
+        self.assertEqual(base64.b64decode(requests[0]["body_base64"]), b'{"a":1}')
+        self.assertEqual(base64.b64decode(requests[1]["body_base64"]), b"a=b")
+        self.assertEqual(base64.b64decode(requests[2]["body_base64"]), b"\x00raw")
+        next_cookie = next(pair[1] for pair in requests[4]["headers"] if pair[0].lower() == "cookie")
+        self.assertIn("initial=yes", next_cookie)
+        self.assertIn("session=one", next_cookie)
+        self.assertIn(["x-default", "one"], [[name.lower(), value] for name, value in requests[0]["headers"]])
+        self.assertEqual(redirected.history[0].status_code, 302)
+        self.assertEqual(redirected.http_version, "HTTP/3")
+
+    async def test_async_concurrent_first_requests_create_one_session(self):
+        client = AsyncClient(go_endpoint=self.endpoint)
+        responses = await asyncio.gather(
+            *(client.get(f"https://target.test/{index}") for index in range(6))
+        )
+        await client.aclose()
+
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(self.state.create_count, 1)
+        self.assertEqual(sum(call["path"] == "/api/v1/capabilities" for call in self.state.calls), 1)
+
+    async def test_async_concurrent_client_not_found_rebuild_is_single_flight(self):
+        client = AsyncClient(go_endpoint=self.endpoint)
+        await client.get("https://target.test/warm")
+        self.state.stale_client_id = "client-1"
+        self.state.stale_expected = 5
+
+        responses = await asyncio.gather(
+            *(client.post(f"https://target.test/{index}", content=str(index).encode()) for index in range(5))
+        )
+        await client.aclose()
+
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(self.state.create_count, 2)
+        request_paths = [call["path"] for call in self.state.calls if call["path"].endswith("/requests")]
+        self.assertEqual(request_paths.count("/api/v1/clients/client-1/requests"), 6)
+        self.assertEqual(request_paths.count("/api/v1/clients/client-2/requests"), 5)
+        for index in range(5):
+            payloads = [
+                call["payload"]
+                for call in self.state.calls
+                if call["path"].endswith("/requests")
+                and call["payload"]["url"] == f"https://target.test/{index}"
+            ]
+            self.assertEqual(payloads[0], payloads[1])
+
+    async def test_async_close_waits_for_request_and_is_idempotent(self):
+        self.state.block_requests = True
+        client = AsyncClient(go_endpoint=self.endpoint)
+        request_task = asyncio.create_task(client.get("https://target.test/slow"))
+        self.assertTrue(await asyncio.to_thread(self.state.request_started.wait, 1))
+        close_task = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0.05)
+        self.assertFalse(close_task.done())
+
+        self.state.release_request.set()
+        response = await request_task
+        await close_task
+        await client.aclose()
+
+        self.assertEqual(response.status_code, 200)
+        paths = [call["path"] for call in self.state.calls]
+        self.assertLess(paths.index("/api/v1/clients/client-1/requests"), paths.index("/api/v1/clients/client-1"))
+
+    async def test_async_error_mapping_and_strict_bad_envelopes_match_sync(self):
+        client = AsyncClient(go_endpoint=self.endpoint)
+        self.state.request_response = (
+            504,
+            b'{"error":{"code":"UPSTREAM_TIMEOUT","message":"late","retryable":true,"request_id":"req-timeout"}}',
+            "application/json",
+        )
+        with self.assertRaises(httpx.TimeoutException) as caught:
+            await client.get("https://target.test/timeout")
+        self.assertEqual(caught.exception.code, "UPSTREAM_TIMEOUT")
+        self.assertEqual(caught.exception.request_id, "req-timeout")
+        self.assertEqual(caught.exception.request.url, httpx.URL("https://target.test/timeout"))
+
+        malformed = [
+            (200, b"{}", "text/plain"),
+            (200, b"{", "application/json"),
+            (200, b'{"protocol_version":2}', "application/json"),
+            (
+                200,
+                json.dumps(
+                    {
+                        "protocol_version": 1,
+                        "request_id": "req-bad",
+                        "status_code": 200,
+                        "reason_phrase": "OK",
+                        "headers": [["Bad Name", "value"]],
+                        "body_base64": "***",
+                        "url": "https://target.test/a",
+                        "http_version": "HTTP/1.1",
+                        "elapsed_ms": 1,
+                        "trace": None,
+                    }
+                ).encode(),
+                "application/json",
+            ),
+        ]
+        for response in malformed:
+            with self.subTest(response=response):
+                self.state.request_response = response
+                with self.assertRaises(GoProtocolError):
+                    await client.get("https://target.test/bad")
+        await client.aclose()
+
+    async def test_async_second_client_not_found_and_rebuild_failure_do_not_loop(self):
+        self.state.not_found_remaining = 2
+        async with AsyncClient(go_endpoint=self.endpoint) as client:
+            with self.assertRaises(GoProtocolError) as caught:
+                await client.post("https://target.test/post", content=b"once")
+        self.assertEqual(caught.exception.code, "CLIENT_NOT_FOUND")
+        self.assertEqual(self.state.create_count, 2)
+        self.assertEqual(sum(call["path"].endswith("/requests") for call in self.state.calls), 2)
+
+        self.state = FakeGo()
+        self.server.state = self.state
+        client = AsyncClient(go_endpoint=self.endpoint)
+        await client.get("https://target.test/warm")
+        self.state.not_found_remaining = 1
+        self.state.create_response = (
+            500,
+            b'{"error":{"code":"INTERNAL_ERROR","message":"create failed","retryable":false}}',
+            "application/json",
+        )
+        with self.assertRaises(GoProtocolError) as caught:
+            await client.get("https://target.test/a")
+        await client.aclose()
+        self.assertEqual(caught.exception.code, "INTERNAL_ERROR")
+        self.assertEqual(caught.exception.request.url, httpx.URL("https://target.test/a"))
+        self.assertEqual(self.state.create_count, 2)
+        self.assertEqual(sum(call["path"].endswith("/requests") for call in self.state.calls), 2)
+
+    async def test_async_control_disconnect_does_not_retry_post(self):
+        client = AsyncClient(go_endpoint=self.endpoint)
+        await client.get("https://target.test/warm")
+        self.state.drop_request_connection = True
+        with self.assertRaises(GoServiceUnavailable) as caught:
+            await client.post("https://target.test/post", content=b"unsafe")
+        self.state.drop_request_connection = False
+        await client.aclose()
+
+        self.assertEqual(caught.exception.request.url, httpx.URL("https://target.test/post"))
+        requests = [call for call in self.state.calls if call["path"].endswith("/requests")]
+        self.assertEqual(sum(call["payload"]["url"] == "https://target.test/post" for call in requests), 1)
+        self.assertEqual(self.state.create_count, 1)
+
+    async def test_async_close_during_started_rebuild_waits_then_deletes_new_session(self):
+        client = AsyncClient(go_endpoint=self.endpoint)
+        await client.get("https://target.test/warm")
+        self.state.not_found_remaining = 1
+        self.state.block_rebuild_create = True
+        request_task = asyncio.create_task(client.get("https://target.test/rebuild"))
+        self.assertTrue(await asyncio.to_thread(self.state.create_started.wait, 1))
+        close_task = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0.05)
+        self.assertFalse(close_task.done())
+
+        self.state.release_create.set()
+        response = await request_task
+        await close_task
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("/api/v1/clients/client-2/requests", [call["path"] for call in self.state.calls])
+        self.assertEqual([call["path"] for call in self.state.calls].count("/api/v1/clients/client-2"), 1)
 
 
 if __name__ == "__main__":
