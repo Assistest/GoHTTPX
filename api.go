@@ -24,7 +24,6 @@ import (
 
 	"github.com/imroc/req/v3"
 	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http/httpguts"
 )
 
 const protocolVersion = 1
@@ -443,7 +442,7 @@ func decodeRequestEnvelope(w http.ResponseWriter, r *http.Request, maxBodyBytes 
 	if input.ProtocolVersion != protocolVersion {
 		return input, nil, nil, &apiError{Code: "PROTOCOL_MISMATCH", Message: "unsupported protocol version"}
 	}
-	if input.Method == "" || len(input.Method) > 64 || !httpguts.ValidHeaderFieldName(input.Method) {
+	if len(input.Method) > 64 || !isHTTPToken(input.Method) {
 		return input, nil, nil, &apiError{Code: "INVALID_REQUEST", Message: "invalid HTTP method"}
 	}
 	if len(input.URL) > 16384 {
@@ -460,11 +459,11 @@ func decodeRequestEnvelope(w http.ResponseWriter, r *http.Request, maxBodyBytes 
 	headerBytes := 0
 	for _, pair := range input.Headers {
 		name, ok := latin1ToBytes(pair[0])
-		if !ok || len(name) == 0 || len(name) > 256 || !httpguts.ValidHeaderFieldName(name) {
+		if !ok || len(name) > 256 || !isHTTPToken(name) {
 			return input, nil, nil, &apiError{Code: "INVALID_REQUEST", Message: "invalid header name"}
 		}
 		value, ok := latin1ToBytes(pair[1])
-		if !ok || len(value) > 16384 || !httpguts.ValidHeaderFieldValue(value) {
+		if !ok || len(value) > 16384 || !isHTTPHeaderValue(value) {
 			return input, nil, nil, &apiError{Code: "INVALID_REQUEST", Message: "invalid header value"}
 		}
 		headerBytes += len(name) + len(value)
@@ -501,6 +500,29 @@ func bytesToLatin1(value string) string {
 		chars[i] = rune(char)
 	}
 	return string(chars)
+}
+
+func isHTTPToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		char := value[i]
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(char)) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isHTTPHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] != '\t' && (value[i] < ' ' || value[i] == 0x7f) {
+			return false
+		}
+	}
+	return true
 }
 
 func classifyUpstreamError(err error) (string, bool) {
