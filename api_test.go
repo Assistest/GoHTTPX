@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"math/big"
@@ -24,6 +25,7 @@ import (
 	neturl "net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -376,6 +378,71 @@ func TestRawRequestPreservesDuplicateHeadersAndBinaryBodies(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cookies, []string{"a=1", "b=2"}) || latin1 != "\u00ff" {
 		t.Fatalf("response headers = %#v", result.Headers)
+	}
+}
+
+func TestRawRequestConcurrentContentTypePresenceIsIsolated(t *testing.T) {
+	type observedRequest struct {
+		path        string
+		contentType []string
+		body        string
+	}
+	const pairs = 12
+	observed := make(chan observedRequest, pairs*2)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		observed <- observedRequest{path: r.URL.Path, contentType: r.Header.Values("Content-Type"), body: string(body)}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	s := newServer("", 48<<20, time.Hour)
+	clientID := addTestClient(t, s)
+	handler := s.routes()
+	errors := make(chan string, pairs*2)
+	var requests sync.WaitGroup
+	for i := 0; i < pairs; i++ {
+		for _, typed := range []bool{false, true} {
+			requests.Add(1)
+			go func(i int, typed bool) {
+				defer requests.Done()
+				path := "/plain/"
+				headers := [][2]string{}
+				if typed {
+					path = "/typed/"
+					headers = [][2]string{{"content-type", "application/one"}, {"CONTENT-TYPE", "application/two"}}
+				}
+				input, _ := json.Marshal(requestEnvelope{
+					ProtocolVersion: protocolVersion,
+					Method:          http.MethodPost,
+					URL:             target.URL + path + fmt.Sprint(i),
+					Headers:         headers,
+					BodyBase64:      base64.StdEncoding.EncodeToString([]byte("payload")),
+				})
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", bytes.NewReader(input)))
+				if response.Code != http.StatusOK {
+					errors <- response.Body.String()
+				}
+			}(i, typed)
+		}
+	}
+	requests.Wait()
+	close(errors)
+	close(observed)
+	for message := range errors {
+		t.Error(message)
+	}
+	for request := range observed {
+		if request.body != "payload" {
+			t.Errorf("%s body = %q", request.path, request.body)
+		}
+		if strings.HasPrefix(request.path, "/plain/") && len(request.contentType) != 0 {
+			t.Errorf("%s Content-Type = %q", request.path, request.contentType)
+		}
+		if strings.HasPrefix(request.path, "/typed/") && !reflect.DeepEqual(request.contentType, []string{"application/one", "application/two"}) {
+			t.Errorf("%s Content-Type = %q", request.path, request.contentType)
+		}
 	}
 }
 
@@ -901,6 +968,7 @@ func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
 	protocol := make(chan int, 4)
 	acceptEncoding := make(chan string, 1)
 	requestBodies := make(chan string, 2)
+	contentTypes := make(chan []string, 2)
 	var retryCalls atomic.Int32
 	var handshakes atomic.Int32
 	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
@@ -914,6 +982,8 @@ func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
 			case "/body":
 				body, _ := io.ReadAll(r.Body)
 				requestBodies <- string(body)
+			case "/content-type":
+				contentTypes <- r.Header.Values("Content-Type")
 			case "/compression":
 				acceptEncoding <- r.Header.Get("Accept-Encoding")
 			case "/large-header":
@@ -1009,6 +1079,29 @@ func TestClientOptionsHTTP3UsesQUICWithTLSConfiguration(t *testing.T) {
 	behaviorClient, err := buildReqClient(behaviorConfig)
 	if err != nil {
 		t.Fatal(err)
+	}
+	const contentTypeClientID = "http3-content-type"
+	s.clients[contentTypeClientID] = &clientSession{client: behaviorClient, config: behaviorConfig, lastUsed: time.Now()}
+	for _, test := range []struct {
+		headers [][2]string
+		want    []string
+	}{
+		{headers: [][2]string{}, want: nil},
+		{headers: [][2]string{{"content-type", "application/one"}, {"CONTENT-TYPE", "application/two"}}, want: []string{"application/one", "application/two"}},
+	} {
+		bridgeResponse := sendRawRequest(t, s.routes(), contentTypeClientID, requestEnvelope{
+			ProtocolVersion: protocolVersion,
+			Method:          http.MethodPost,
+			URL:             targetURL + "/content-type",
+			Headers:         test.headers,
+			BodyBase64:      base64.StdEncoding.EncodeToString([]byte("payload")),
+		})
+		if bridgeResponse.Code != http.StatusOK || <-protocol != 3 {
+			t.Fatalf("status=%d body=%s", bridgeResponse.Code, bridgeResponse.Body.String())
+		}
+		if got := <-contentTypes; !reflect.DeepEqual(got, test.want) {
+			t.Fatalf("Content-Type = %q, want %q", got, test.want)
+		}
 	}
 	compressedResponse, err := behaviorClient.R().Get(targetURL + "/compression")
 	if err != nil || compressedResponse.StatusCode != http.StatusNoContent || <-protocol != 3 || <-acceptEncoding != "gzip" {
