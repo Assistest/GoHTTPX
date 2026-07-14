@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+// 目标请求的超时由其 context 控制，不能被控制连接的全局写超时提前中断。
+const controlWriteTimeout = 0 * time.Second
+
 type cliOptions struct {
 	host             string
 	port             int
@@ -81,7 +84,7 @@ func main() {
 		Handler:           registry.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      controlWriteTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
 
