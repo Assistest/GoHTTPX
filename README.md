@@ -4,6 +4,8 @@ GoHTTPX 在本机常驻一个 Go 发包服务，让 Python 继续使用 HTTPX 0.
 
 当前发布版本为 `1.0.0`，控制协议为 `/api/v1`、`protocol_version=1`。依赖固定为 req/v3 `v3.59.0`、quic-go `v0.60.0`、uTLS `v1.8.2`；Python 最低版本为 3.10，要求 `httpx>=0.28,<0.29`。
 
+公开发布与手动部署请同时阅读 [更新记录](CHANGELOG.md) 和 [运维说明](RUNBOOK.md)。每个发布二进制的 SHA-256、大小和源码 revision 以对应 GitHub Release 为准。
+
 ## 架构与状态边界
 
 一个由运维人员手动启动的 loopback Go 服务，可以由同一 Python 后端中的多个站点模块共享。同步 `Client` 在构造时立即创建 Go `req.Client` 会话；异步 `AsyncClient` 在第一次请求时懒创建。每个已经创建会话的 client 都对应一个独立 Go session，因此 TLS、代理、HTTP 版本、连接池和重试配置互不串用。

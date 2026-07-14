@@ -394,6 +394,8 @@ gohttpx-server.exe --version
 - stdout/stderr 没有启动或请求日志。
 - 工作树没有未提交源码修改。
 
+公开 GitHub 发布时，发布记录以对应 GitHub Release 为准；其中必须写明版本、clean revision、EXE SHA-256 和字节数。手动部署步骤见 `RUNBOOK.md`，变更摘要见 `CHANGELOG.md`。
+
 ## 16. 后续修改规则
 
 ### 16.1 新增 ClientOptions 字段
