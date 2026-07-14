@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 /gohttpx-server.exe
 /gohttpx-server.exe~
+.superpowers/

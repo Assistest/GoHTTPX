@@ -37,12 +37,13 @@ class TransportE2ETests(unittest.TestCase):
             go_token=self.service.token,
             verify=self.target.ca_path,
             cert=(self.target.client_cert_path, self.target.client_key_path),
+            client_options=ClientOptions(http_version="http2"),
         ) as client:
             response = client.get(self.target.mtls_endpoint + "/observe")
 
         observed = response.json()
         self.assertTrue(observed["peer_cert_present"])
-        self.assertIn(observed["protocol"], ("HTTP/1.1", "HTTP/2.0"))
+        self.assertEqual(observed["protocol"], "HTTP/2.0")
 
     def test_connect_proxy_forwards_auth_and_explicit_headers(self):
         with ConnectProxyFixture("user", "pass") as proxy:

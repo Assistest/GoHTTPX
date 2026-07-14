@@ -183,6 +183,7 @@ for client in (http1, http2, http3, h2c):
 - `impersonate` 与任何显式 `tls_fingerprint` 互斥；impersonate 可选 `none/chrome/firefox/safari`。
 - proxy 不能与强制 `http2`、`http3`、`h2c` 组合；proxy 与 `auto/http1` 可用。
 - HTTP/3 不接受显式 TLS fingerprint 或非 `none` impersonate，使用标准 QUIC TLS。
+- 强制 HTTPS HTTP/2 不接受显式 TLS fingerprint 或非 `none` impersonate；省略两者时使用 req 的标准 TLS 以协商 `h2`，并支持 mTLS。
 - HTTP/3 支持 verify、root CA、client cert/key、compression、GET body、retry、trace、dump、单次 timeout 和 `max_response_header_bytes`。
 - HTTP/3 将 `tls_handshake_timeout_ms` 映射为 QUIC `HandshakeIdleTimeout`，将 `idle_conn_timeout_ms` 映射为 QUIC `MaxIdleTimeout`。直接发送 0 时采用 quic-go 的 5 秒/30 秒默认；Python `TransportOptions` 默认会显式发送 10000/90000 ms。
 - HTTP/3 的 proxy、HTTP 阶段 timeout、TCP pool/buffer 选项和非默认 HTTP/2 嵌套选项会在创建会话时返回 `INVALID_REQUEST`。空 map/slice 和数值 0 视为默认。
@@ -203,7 +204,7 @@ for client in (http1, http2, http3, h2c):
 | 360 | `360_auto`, `360_7_5`, `360_11_0` |
 | QQ | `qq_auto`, `qq_11_1` |
 
-`ClientOptions.tls_fingerprint` 的 Python 默认是 `None`；当 HTTP 版本不是 HTTP/3 且 impersonate 为 `none` 时，SDK 的有效默认是 `android_11_okhttp`。
+`ClientOptions.tls_fingerprint` 的 Python 默认是 `None`；当 HTTP 版本为 `auto/http1/h2c` 且 impersonate 为 `none` 时，SDK 的有效默认是 `android_11_okhttp`。强制 HTTPS HTTP/2 与 HTTP/3 使用标准 TLS。
 
 ## 完整 DTO 字段矩阵
 
@@ -213,8 +214,8 @@ for client in (http1, http2, http3, h2c):
 
 | 字段 | Python 类型 | 默认 | 含义、边界与 HTTP/3 规则 |
 |---|---|---:|---|
-| `tls_fingerprint` | `TLSFingerprint | str | None` | `None` | 非 HTTP/3 且无 impersonate 时有效默认 `android_11_okhttp`；值必须属于 49 项目录。HTTP/3 只能省略。 |
-| `impersonate` | `Impersonate | str` | `none` | `none/chrome/firefox/safari`；非 `none` 与显式 fingerprint 互斥，HTTP/3 拒绝。 |
+| `tls_fingerprint` | `TLSFingerprint | str | None` | `None` | `auto/http1/h2c` 且无 impersonate 时有效默认 `android_11_okhttp`；强制 HTTPS HTTP/2、HTTP/3 必须省略。 |
+| `impersonate` | `Impersonate | str` | `none` | `none/chrome/firefox/safari`；非 `none` 与显式 fingerprint 互斥，强制 HTTPS HTTP/2、HTTP/3 拒绝。 |
 | `proxy_url` | `str | None` | `None` | 固定 `http/https/socks5/socks5h` URL；不能与强制 HTTP/2、HTTP/3、H2C 组合。 |
 | `verify` | `bool` | `True` | 是否校验证书；HTTP/3 生效。 |
 | `root_ca_pem` | `str | None` | `None` | 一个或多个纯 `CERTIFICATE` PEM，禁止夹杂其他字节/块；HTTP/3 生效。 |
@@ -379,3 +380,5 @@ python -c "from pathlib import Path; [compile(p.read_text(encoding='utf-8'), str
 ```
 
 Go 测试使用 `testing/httptest`，Python 使用 `unittest`。Python E2E 会在系统临时目录构建单个临时 EXE，启动本机 Go 服务和本机目标 HTTP 服务，覆盖正文编码、cookies、redirect、Basic/Digest auth、重复 query/header、错误状态、timeout、会话隔离与重建；测试不访问公网，结束后删除该临时 EXE。
+
+运行 Python 全套测试还需要 `cryptography`：`python -m pip install "httpx>=0.28,<0.29" "cryptography"`。

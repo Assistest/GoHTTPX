@@ -1028,7 +1028,7 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 				client.SetTLSFingerprint(clientHelloID)
 			}
 		}
-		if input.ClientCertPEM != "" {
+		if input.ClientCertPEM != "" && input.HTTPVersion != "http2" {
 			setClientCertificateTLSHandshake(client, clientHelloID)
 		}
 	}
