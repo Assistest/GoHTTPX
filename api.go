@@ -40,7 +40,7 @@ const (
 	retryBackoff         = "backoff"
 )
 
-var serverVersion = "1.0.1"
+var serverVersion = "1.0.2"
 
 func versionLine() string {
 	versions := map[string]string{}
