@@ -51,3 +51,10 @@ python -B -m unittest python.test_gohttpx.GoHTTPXE2ETests -v
 ```
 
 在未改动前后均因既有 `python/test_gohttpx.py` 的 `from gohttpx import ...` 缺少模块搜索路径而失败（`ModuleNotFoundError: gohttpx`）。为避免扩大本任务范围，未改测试模块的既有导入约定；从 `python` 目录执行等价的 E2E 命令已通过。
+
+## 审查修复追加
+
+- `test_real_service_starts_and_removes_its_temp_exe` 现在在保存 `exe_path` 后以 `try/finally` 执行 health 断言；断言失败时仍会调用 `service.close()`，随后断言该保存路径不存在。
+- 覆盖修复的测试：`python -B -m unittest test_gohttpx.GoHTTPXE2ETests.test_real_service_starts_and_removes_its_temp_exe -v`（在 `python` 目录）通过：`Ran 1 test in 20.843s`，`OK`。
+- 根目录标准命令：`python -B -m unittest discover -s python -p "test_gohttpx.py" -v` 通过：`Ran 62 tests in 54.736s`，`OK`。
+- 修复提交：`test: 确保 E2E 生命周期测试总会清理`。

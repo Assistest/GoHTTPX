@@ -1643,9 +1643,11 @@ class GoHTTPXE2ETests(unittest.TestCase):
     def test_real_service_starts_and_removes_its_temp_exe(self):
         service = GoHTTPXService(module_dir=Path(__file__).resolve().parents[1])
         service.start()
-        self.assertEqual(httpx.get(service.endpoint + "/api/v1/health", trust_env=False).status_code, 200)
         exe_path = service.exe_path
-        service.close()
+        try:
+            self.assertEqual(httpx.get(service.endpoint + "/api/v1/health", trust_env=False).status_code, 200)
+        finally:
+            service.close()
         self.assertFalse(exe_path.exists())
 
     @classmethod
