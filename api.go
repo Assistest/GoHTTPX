@@ -34,12 +34,13 @@ import (
 
 const (
 	protocolVersion      = 1
-	serverVersion        = "1.0.0"
 	maxClientConfigBytes = 4 << 20
 	retryNone            = "none"
 	retryFixed           = "fixed"
 	retryBackoff         = "backoff"
 )
+
+var serverVersion = "1.0.0"
 
 func versionLine() string {
 	versions := map[string]string{}
@@ -142,6 +143,7 @@ type errorResponse struct {
 
 type createClientRequest struct {
 	ProtocolVersion int             `json:"protocol_version"`
+	SDKVersion      string          `json:"sdk_version"`
 	TLSFingerprint  string          `json:"tls_fingerprint,omitempty"`
 	Impersonate     string          `json:"impersonate,omitempty"`
 	ProxyURL        string          `json:"proxy_url,omitempty"`
@@ -531,6 +533,10 @@ func (s *server) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.ProtocolVersion != protocolVersion {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "PROTOCOL_MISMATCH", Message: "unsupported protocol version"}})
+		return
+	}
+	if input.SDKVersion != serverVersion {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "VERSION_MISMATCH", Message: "Python SDK 与 Go 服务端版本不匹配，请执行 pip install --upgrade gohttpx 或从 GitHub Release 下载并升级对应版本的 Go 服务端"}})
 		return
 	}
 	if input.Impersonate == "" {

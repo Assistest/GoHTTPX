@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 将现有 Python 客户端发布为可通过 `pip install gohttpx` 安装的 PyPI 包，并在本地 Go bridge 不可达时给出仓库引导。
+**Goal:** 将现有 Python 客户端发布为可通过 `pip install gohttpx` 安装的 PyPI 包，在本地 Go bridge 不可达时给出仓库引导，并通过同标签 Windows Go Release 与严格版本握手防止前后端混用。
 
-**Architecture:** 根目录的 `pyproject.toml` 将单文件模块 `python/gohttpx.py` 构建为 `gohttpx` 分发包。客户端仅在控制面连接异常时将 HTTPX 连接错误包装为带 GitHub 地址的 `GoServiceUnavailable`，其他 HTTPX 语义不变。GitHub Actions 复用测试环境，并只在 `v*` 标签上发布已验证的 wheel/sdist。
+**Architecture:** 根目录的 `pyproject.toml` 将单文件模块 `python/gohttpx.py` 构建为 `gohttpx` 分发包。客户端仅在控制面连接异常时将 HTTPX 连接错误包装为带 GitHub 地址的 `GoServiceUnavailable`，其他 HTTPX 语义不变；创建会话时附带 SDK 版本，Go 服务端要求与构建版本完全一致。GitHub Actions 以同一个 `v*` 标签发布已验证的 wheel/sdist 与 Windows amd64 服务端附件。
 
 **Tech Stack:** Python 3.10+、setuptools、build、twine、HTTPX 0.28.x、GitHub Actions、PyPI Trusted Publishing。
 
@@ -14,6 +14,8 @@
 - 支持 Python `>=3.10`，运行依赖固定为 `httpx>=0.28,<0.29`。
 - wheel 不包含、下载或启动 Go 二进制；Go 服务仍由用户手工常驻运行。
 - 仅 bridge 控制面不可连接时提供引导；目标站点错误保留 HTTPX 既有语义。
+- `vX.Y.Z`、`pyproject.toml`、Python `__version__` 与 Go 服务端构建版本必须完全一致。
+- 版本不一致必须拒绝创建会话；只发布 Windows amd64 二进制及 SHA-256。
 - 文档、注释与用户可见错误使用中文；代码标识符使用英文。
 
 ---
@@ -97,14 +99,14 @@ git commit -m "feat: 支持 PyPI 安装与服务引导"
 ### Task 2: 添加安全发布工作流与用户文档
 
 **Files:**
-- Create: `.github/workflows/publish-pypi.yml`
+- Create: `.github/workflows/publish-release.yml`
 - Modify: `README.md: Python 使用说明`
 - Modify: `CHANGELOG.md: 1.0.0`
 - Modify: `.gitignore`
 
 **Interfaces:**
 - Consumes: Task 1 构建出的 wheel/sdist 及现有 Python 测试。
-- Produces: 推送 `v*` 标签后的 PyPI 发布流程；README 中的安装、服务启动和异常引导说明。
+- Produces: 推送 `v*` 标签后的 PyPI 与多平台 GitHub Release 发布流程；README 中的安装、服务启动和异常引导说明。
 
 - [ ] **Step 1: 写出发布元数据检查**
 
@@ -126,7 +128,7 @@ permissions:
   contents: read
 ```
 
-工作流在 Ubuntu 上安装 Python 3.10、安装 `build` 与测试依赖、运行 Python 全量测试、执行 `python -m build` 和 `twine check dist/*`，最后使用 `pypa/gh-action-pypi-publish` 的 Trusted Publishing 上传。发布前校验标签去掉 `v` 后与 `pyproject.toml` 的版本相同。
+工作流在 Ubuntu 上安装 Python 3.10、安装 `build` 与测试依赖、运行 Python 全量测试、执行 `python -m build` 和 `twine check dist/*`，最后使用 `pypa/gh-action-pypi-publish` 的 Trusted Publishing 上传。发布前校验标签去掉 `v` 后与 `pyproject.toml` 的版本相同。PyPI 成功后在 Windows runner 构建 Windows amd64 二进制，将标签通过 `-ldflags "-X main.serverVersion=X.Y.Z"` 注入二进制，生成 SHA-256 文件并创建 GitHub Release。
 
 - [ ] **Step 3: 更新 README 与变更记录**
 
@@ -151,8 +153,48 @@ python -B -m unittest discover -s python -p "test_*.py" -v
 预期：构建产物元数据合法、测试全通过。
 
 ```text
-git add .github/workflows/publish-pypi.yml README.md CHANGELOG.md .gitignore python/test_package_install.py
-git commit -m "ci: 支持标签发布 PyPI"
+git add .github/workflows/publish-release.yml README.md CHANGELOG.md .gitignore python/test_package_install.py
+git commit -m "ci: 支持标签发布 PyPI 与服务端"
+```
+
+### Task 3: 强制 Python 与 Go 服务端版本匹配
+
+**Files:**
+- Modify: `api.go:36-38, 128-135, 490-510, 530-540`
+- Modify: `api_test.go:69-96, 240-280`
+- Modify: `python/gohttpx.py:335-345, 491-510`
+- Modify: `python/test_gohttpx.py:339-365, 708-740`
+
+**Interfaces:**
+- Consumes: Python `__version__` 与 Go linker 注入的 `serverVersion`。
+- Produces: 创建会话请求必填 `sdk_version: str`；版本不同返回 `VERSION_MISMATCH`，Python 映射为 `GoProtocolError`。
+
+- [ ] **Step 1: 写出版本不一致的失败测试**
+
+Go 测试创建 `sdk_version` 与 `serverVersion` 不同的会话请求并断言返回 `VERSION_MISMATCH`。Python 测试断言创建 payload 含 `sdk_version == __version__`，且服务端返回版本错误时抛 `GoProtocolError`。
+
+运行：`go test ./... -run Version` 和 `python -B -m unittest python/test_gohttpx.py -v`。
+
+预期：当前请求没有 `sdk_version`，测试失败。
+
+- [ ] **Step 2: 实现严格版本握手**
+
+将 Go `serverVersion` 改为可被 `-ldflags -X main.serverVersion=X.Y.Z` 覆盖的变量。创建会话请求新增 `SDKVersion string json:"sdk_version"`，严格 JSON 解码要求该字段；当 `SDKVersion != serverVersion` 时返回 `VERSION_MISMATCH` 和明确的 pip/Release 升级提示。Python 创建 payload 写入 `sdk_version=__version__`，能力响应的 `server_version` 必须等于 `__version__`。
+
+- [ ] **Step 3: 验证并提交**
+
+运行：
+
+```text
+go test ./... -count=1
+python -B -m unittest discover -s python -p "test_*.py" -v
+```
+
+预期：Go、Python 测试均通过。
+
+```text
+git add api.go api_test.go python/gohttpx.py python/test_gohttpx.py
+git commit -m "feat: 强制前后端版本匹配"
 ```
 
 ## 自查

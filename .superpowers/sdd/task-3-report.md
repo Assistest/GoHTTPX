@@ -53,3 +53,10 @@ ok   gohttpx  (cached)
 ## 顾虑
 
 - 证书密钥每次测试临时生成；序列号、主题、用途及 loopback SAN 固定，测试不依赖系统 CA 或 openssl。
+
+## 版本握手更新
+
+- Go `serverVersion` 现在可由 `-ldflags -X main.serverVersion=X.Y.Z` 注入。
+- 创建会话强制 `sdk_version` 与服务端一致；不一致返回 `VERSION_MISMATCH`，并指向 pip 与 GitHub Release 升级。
+- Python 创建 payload 带 `sdk_version=__version__`，能力响应或服务端错误的版本不一致均为 `GoProtocolError`。
+- 验证：`go test ./... -run Version -count=1`、`go test ./... -count=1`、`python -B -m unittest discover -s python -p "test_*.py" -q` 均通过。

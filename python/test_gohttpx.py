@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
+import gohttpx
 
 from gohttpx import (
     __version__,
@@ -354,6 +355,7 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(all(call["authorization"] == "Bearer secret" for call in self.state.calls))
         create = self.state.calls[1]["payload"]
         self.assertEqual(create["protocol_version"], 1)
+        self.assertEqual(create["sdk_version"], __version__)
         self.assertEqual(create["tls_fingerprint"], "android_11_okhttp")
         self.assertEqual(create["impersonate"], "none")
         self.assertEqual(create["http_version"], "auto")
@@ -716,6 +718,7 @@ class ClientTests(unittest.TestCase):
             {**valid, "extra": True},
             {**valid, "server_version": ""},
             {**valid, "server_version": 1},
+            {**valid, "server_version": "0.0.0"},
             {**valid, "max_body_bytes": True},
             {**valid, "max_body_bytes": 0},
             {**valid, "tls_fingerprints": FINGERPRINTS + [FINGERPRINTS[0]]},
@@ -735,6 +738,16 @@ class ClientTests(unittest.TestCase):
                     [(call["method"], call["path"]) for call in self.state.calls],
                     [("GET", "/api/v1/capabilities")],
                 )
+
+    def test_version_mismatch_response_raises_protocol_error(self):
+        self.state.create_response = (
+            400,
+            b'{"error":{"code":"VERSION_MISMATCH","message":"upgrade","retryable":false}}',
+            "application/json",
+        )
+        with self.assertRaises(GoProtocolError) as caught:
+            Client(go_endpoint=self.endpoint)
+        self.assertEqual(caught.exception.code, "VERSION_MISMATCH")
 
     def test_invalid_create_success_with_client_id_is_deleted_without_masking_error(self):
         invalid_envelopes = [
@@ -835,6 +848,19 @@ class ClientTests(unittest.TestCase):
                 ("DELETE", "/api/v1/clients/client-1"),
             ],
         )
+
+    def test_unavailable_service_has_github_guidance(self):
+        transport = gohttpx._GoTransport.__new__(gohttpx._GoTransport)
+        transport._endpoint = "http://127.0.0.1:1"
+        transport._control = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(httpx.ConnectError("down", request=request))
+            )
+        )
+        with self.assertRaises(GoServiceUnavailable) as caught:
+            transport._call("GET", "/api/v1/capabilities", None, None)
+        self.assertIsInstance(caught.exception, httpx.ConnectError)
+        self.assertIn("github.com/Assistest/GoHTTPX", str(caught.exception))
 
     def test_service_unavailable_and_control_client_ignores_environment_proxy(self):
         probe = ThreadingHTTPServer(("127.0.0.1", 0), FakeGoHandler)

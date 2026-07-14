@@ -1,0 +1,80 @@
+name: Publish release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python -m pip install build twine "httpx>=0.28,<0.29" cryptography
+      - id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(python -c 'import re; from pathlib import Path; project = re.search(r"(?ms)^\[project\]\s*$(.*?)(?=^\[|\Z)", Path("pyproject.toml").read_text(encoding="utf-8")).group(1); print(re.search(r"(?m)^version\s*=\s*\"([^\"]+)\"\s*$", project).group(1))')"
+          module_version="$(python -c 'import ast; from pathlib import Path; print(next(node.value.value for node in ast.parse(Path("python/gohttpx.py").read_text(encoding="utf-8")).body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)))')"
+          test "$version" = "$package_version"
+          test "$version" = "$module_version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - run: python -m build
+      - run: python -B -m unittest discover -s python -p "test_*.py" -v
+      - run: python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+
+  publish-pypi:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  build-binaries:
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+      - name: Build server
+        run: $env:GOOS = "windows"; $env:GOARCH = "amd64"; go build -trimpath -ldflags "-s -w -X main.serverVersion=${{ needs.validate.outputs.version }}" -o gohttpx-server-windows-amd64.exe .
+      - name: Write SHA-256
+        shell: pwsh
+        run: $file = "gohttpx-server-windows-amd64.exe"; "$((Get-FileHash -Algorithm SHA256 $file).Hash.ToLower())  $file" | Set-Content -NoNewline "$file.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-windows-amd64
+          path: gohttpx-server-windows-amd64.exe*
+
+  github-release:
+    needs: [publish-pypi, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: server-*
+          merge-multiple: true
+          path: release-assets/
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" release-assets/* --title "${GITHUB_REF_NAME}" --generate-notes

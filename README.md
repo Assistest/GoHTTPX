@@ -1,5 +1,23 @@
 # GoHTTPX Bridge v1
 
+## Python PyPI 安装
+
+```powershell
+pip install gohttpx
+```
+
+Go 服务端不属于 pip 包。请从 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases) 获取与 Python SDK 同标签的 Windows amd64 安装包，并校验随附 SHA-256 文件。Go 服务端不可达时会抛出 `GoServiceUnavailable`，消息会指向 Releases 地址。
+
+```python
+from gohttpx import Client, GoServiceUnavailable
+
+try:
+    with Client(go_token="replace-with-secret") as client:
+        client.get("https://example.test/")
+except GoServiceUnavailable as error:
+    print(error)
+```
+
 GoHTTPX 在本机常驻一个 Go 发包服务，让 Python 继续使用 HTTPX 0.28 的 `Client`、`AsyncClient`、请求编码、cookies、auth、redirect 和 `Response` 语义，同时把目标请求交给 req/v3、uTLS 或 HTTP/3 Transport 执行。
 
 当前发布版本为 `1.0.0`，控制协议为 `/api/v1`、`protocol_version=1`。依赖固定为 req/v3 `v3.59.0`、quic-go `v0.60.0`、uTLS `v1.8.2`；Python 最低版本为 3.10，要求 `httpx>=0.28,<0.29`。
