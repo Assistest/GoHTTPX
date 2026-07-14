@@ -355,6 +355,7 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(all(call["authorization"] == "Bearer secret" for call in self.state.calls))
         create = self.state.calls[1]["payload"]
         self.assertEqual(create["protocol_version"], 1)
+        self.assertEqual(create["sdk_version"], __version__)
         self.assertEqual(create["tls_fingerprint"], "android_11_okhttp")
         self.assertEqual(create["impersonate"], "none")
         self.assertEqual(create["http_version"], "auto")
@@ -717,6 +718,7 @@ class ClientTests(unittest.TestCase):
             {**valid, "extra": True},
             {**valid, "server_version": ""},
             {**valid, "server_version": 1},
+            {**valid, "server_version": "0.0.0"},
             {**valid, "max_body_bytes": True},
             {**valid, "max_body_bytes": 0},
             {**valid, "tls_fingerprints": FINGERPRINTS + [FINGERPRINTS[0]]},
@@ -736,6 +738,16 @@ class ClientTests(unittest.TestCase):
                     [(call["method"], call["path"]) for call in self.state.calls],
                     [("GET", "/api/v1/capabilities")],
                 )
+
+    def test_version_mismatch_response_raises_protocol_error(self):
+        self.state.create_response = (
+            400,
+            b'{"error":{"code":"VERSION_MISMATCH","message":"upgrade","retryable":false}}',
+            "application/json",
+        )
+        with self.assertRaises(GoProtocolError) as caught:
+            Client(go_endpoint=self.endpoint)
+        self.assertEqual(caught.exception.code, "VERSION_MISMATCH")
 
     def test_invalid_create_success_with_client_id_is_deleted_without_masking_error(self):
         invalid_envelopes = [

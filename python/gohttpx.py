@@ -339,6 +339,7 @@ def _retarget_transport_error(error: BaseException, request: httpx.Request) -> B
 def _client_payload(options: ClientOptions) -> dict[str, Any]:
     payload = _wire(options)
     payload["protocol_version"] = 1
+    payload["sdk_version"] = __version__
     impersonate = payload.get("impersonate", "none")
     if payload.get("http_version") == "http3":
         defaults = TransportOptions()
@@ -503,7 +504,9 @@ class _GoTransport(httpx.BaseTransport):
             raise GoProtocolError("capabilities 包含非法字段", request=request)
         if type(data.get("protocol_version")) is not int or data["protocol_version"] != 1:
             raise GoProtocolError("Go 服务不支持控制协议 v1", request=request)
-        if not isinstance(data["server_version"], str) or not data["server_version"]:
+        if data["server_version"] != __version__:
+            raise GoProtocolError("Python SDK 与 Go 服务端版本不匹配，请升级 pip 包或 GitHub Release 服务端", request=request)
+        if not isinstance(data["server_version"], str):
             raise GoProtocolError("capabilities 缺少合法 server_version", request=request)
         if type(data["max_body_bytes"]) is not int or data["max_body_bytes"] <= 0:
             raise GoProtocolError("capabilities 缺少合法 max_body_bytes", request=request)

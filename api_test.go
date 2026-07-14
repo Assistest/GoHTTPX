@@ -108,6 +108,18 @@ func TestVersionFlagNeedsNoTokenAndReportsFixedBuildVersions(t *testing.T) {
 	}
 }
 
+func TestVersionFlagUsesLinkerServerVersion(t *testing.T) {
+	command := exec.Command("go", "run", "-ldflags", "-X main.serverVersion=1.2.3", ".", "--version")
+	command.Env = append(os.Environ(), "GOHTTPX_TOKEN=")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--version failed: %v\n%s", err, output)
+	}
+	if !strings.HasPrefix(string(output), "GoHTTPX server 1.2.3 protocol 1 ") {
+		t.Fatalf("--version output = %q", output)
+	}
+}
+
 func TestCLIHelpDescribesBidirectionalBodyLimit(t *testing.T) {
 	command := exec.Command("go", "run", ".", "--help")
 	output, err := command.CombinedOutput()
@@ -169,7 +181,7 @@ func TestControlPOSTRequiresJSONContentType(t *testing.T) {
 		body        string
 		validStatus int
 	}{
-		{path: "/api/v1/clients", body: `{"protocol_version":1}`, validStatus: http.StatusCreated},
+		{path: "/api/v1/clients", body: `{"protocol_version":1,"sdk_version":"` + serverVersion + `"}`, validStatus: http.StatusCreated},
 		{path: "/api/v1/clients/missing/requests", body: `{}`, validStatus: http.StatusNotFound},
 	}
 	invalid := []struct {
@@ -239,7 +251,7 @@ func TestClientLifecycleUsesDefaultFingerprintAndDeleteIsIdempotent(t *testing.T
 	s := newServer("", 48<<20, time.Hour)
 	handler := s.routes()
 	created := httptest.NewRecorder()
-	handler.ServeHTTP(created, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1}`)))
+	handler.ServeHTTP(created, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"sdk_version":"`+serverVersion+`"}`)))
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
 	}
@@ -273,10 +285,23 @@ func TestClientLifecycleUsesDefaultFingerprintAndDeleteIsIdempotent(t *testing.T
 	}
 }
 
+func TestClientLifecycleRejectsMismatchedSDKVersion(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	response := httptest.NewRecorder()
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"sdk_version":"0.0.0"}`)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	apiErr := decodeAPIError(t, response)
+	if apiErr.Code != "VERSION_MISMATCH" || !strings.Contains(apiErr.Message, "pip install --upgrade gohttpx") || !strings.Contains(apiErr.Message, "Release") {
+		t.Fatalf("error = %#v", apiErr)
+	}
+}
+
 func TestClientLifecycleRejectsUnsupportedFingerprint(t *testing.T) {
 	s := newServer("", 48<<20, time.Hour)
 	response := httptest.NewRecorder()
-	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"tls_fingerprint":"not-a-fingerprint"}`)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"sdk_version":"`+serverVersion+`","tls_fingerprint":"not-a-fingerprint"}`)))
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
@@ -1513,12 +1538,12 @@ func TestClientOptionsHTTP3MapsOnlyEquivalentConfiguration(t *testing.T) {
 
 	s := newServer("", 48<<20, time.Hour)
 	response := httptest.NewRecorder()
-	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3","transport":{"read_buffer_size":1}}`)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"sdk_version":"`+serverVersion+`","http_version":"http3","transport":{"read_buffer_size":1}}`)))
 	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "read_buffer_size") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 	response = httptest.NewRecorder()
-	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3","transport":{"proxy_connect_headers":{}},"http2":{"connection_flow":0,"max_header_list_size":0}}`)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"sdk_version":"`+serverVersion+`","http_version":"http3","transport":{"proxy_connect_headers":{}},"http2":{"connection_flow":0,"max_header_list_size":0}}`)))
 	if response.Code != http.StatusCreated {
 		t.Fatalf("default-valued HTTP/3 options rejected: status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -1527,7 +1552,7 @@ func TestClientOptionsHTTP3MapsOnlyEquivalentConfiguration(t *testing.T) {
 func createHTTP3Session(t *testing.T, s *server) (string, *http3.Transport) {
 	t.Helper()
 	created := httptest.NewRecorder()
-	s.routes().ServeHTTP(created, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3"}`)))
+	s.routes().ServeHTTP(created, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"sdk_version":"`+serverVersion+`","http_version":"http3"}`)))
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
 	}
@@ -1779,7 +1804,7 @@ func TestClientOptionsRejectIgnoredRetryFields(t *testing.T) {
 func TestCreateClientRejectsIgnoredRetryField(t *testing.T) {
 	s := newServer("", 48<<20, time.Hour)
 	response := httptest.NewRecorder()
-	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"retry":{"count":1,"mode":"fixed","fixed_interval_ms":1,"backoff_min_ms":1}}`)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"sdk_version":"`+serverVersion+`","retry":{"count":1,"mode":"fixed","fixed_interval_ms":1,"backoff_min_ms":1}}`)))
 	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "retry.backoff_min_ms") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -1790,8 +1815,8 @@ func TestClientOptionsStrictNestedJSONAndInvalidConfigurationCode(t *testing.T) 
 		`{"protocol_version":1,"retry":{"unknown":1}}`,
 		`{"protocol_version":1,"transport":{"unknown":1}}`,
 		`{"protocol_version":1,"http2":{"settings":[{"id":1,"value":1,"unknown":1}]}}`,
-		`{"protocol_version":1,"proxy_url":"ftp://proxy.example"}`,
-		`{"protocol_version":1,"impersonate":"chrome","tls_fingerprint":"golang"}`,
+		`{"protocol_version":1,"sdk_version":"` + serverVersion + `","proxy_url":"ftp://proxy.example"}`,
+		`{"protocol_version":1,"sdk_version":"` + serverVersion + `","impersonate":"chrome","tls_fingerprint":"golang"}`,
 	} {
 		s := newServer("", 48<<20, time.Hour)
 		response := httptest.NewRecorder()
