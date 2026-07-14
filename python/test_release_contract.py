@@ -20,6 +20,7 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertNotIn(r'\\"', workflow)
         self.assertIn('test "$version" = "$module_version"', workflow)
         self.assertIn("-X main.serverVersion=${{ needs.validate.outputs.version }}", workflow)
+        self.assertIn('gh release create "${GITHUB_REF_NAME}" release-assets/* --repo "$GITHUB_REPOSITORY"', workflow)
 
     def test_install_test_does_not_hardcode_dist_info_version(self):
         source = (Path(__file__).parent / "test_package_install.py").read_text(encoding="utf-8")
