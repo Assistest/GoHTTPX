@@ -21,7 +21,7 @@ jobs:
       - id: version
         run: |
           version="${GITHUB_REF_NAME#v}"
-          package_version="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")"
+          package_version="$(python -c 'import re; from pathlib import Path; project = re.search(r"(?ms)^\[project\]\s*$(.*?)(?=^\[|\Z)", Path("pyproject.toml").read_text(encoding="utf-8")).group(1); print(re.search(r"(?m)^version\s*=\s*\"([^\"]+)\"\s*$", project).group(1))')"
           module_version="$(python -c 'import ast; from pathlib import Path; print(next(node.value.value for node in ast.parse(Path("python/gohttpx.py").read_text(encoding="utf-8")).body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)))')"
           test "$version" = "$package_version"
           test "$version" = "$module_version"
