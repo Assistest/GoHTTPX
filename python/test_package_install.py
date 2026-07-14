@@ -7,11 +7,17 @@ from pathlib import Path
 
 
 class PackageInstallTests(unittest.TestCase):
-    def test_wheel_metadata_declares_package_requirements(self):
+    def get_wheel(self):
         root = Path(__file__).parent.parent
         wheels = list((root / "dist").glob("gohttpx-*.whl"))
+        if not wheels:
+            subprocess.run([sys.executable, "-m", "build"], check=True, text=True, encoding="utf-8", cwd=root)
+            wheels = list((root / "dist").glob("gohttpx-*.whl"))
         self.assertEqual(len(wheels), 1, "expected one built wheel")
-        with zipfile.ZipFile(wheels[0]) as wheel:
+        return wheels[0]
+
+    def test_wheel_metadata_declares_package_requirements(self):
+        with zipfile.ZipFile(self.get_wheel()) as wheel:
             metadata_paths = [path for path in wheel.namelist() if Path(path).match("*.dist-info/METADATA")]
             self.assertEqual(len(metadata_paths), 1, "expected one wheel metadata file")
             metadata = wheel.read(metadata_paths[0]).decode()
@@ -20,10 +26,7 @@ class PackageInstallTests(unittest.TestCase):
         self.assertIn("Requires-Dist: httpx<0.29,>=0.28", metadata)
 
     def test_installed_package_exports_client(self):
-        root = Path(__file__).parent.parent
-        wheels = list((root / "dist").glob("gohttpx-*.whl"))
-        self.assertEqual(len(wheels), 1, "expected one built wheel")
-        wheel = wheels[0]
+        wheel = self.get_wheel()
         with tempfile.TemporaryDirectory() as directory:
             environment = Path(directory) / "venv"
             subprocess.run(
