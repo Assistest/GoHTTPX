@@ -293,22 +293,22 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             protocol = "HTTP/1.1"
         elif target_path == "/final":
             protocol = "HTTP/3.0"
-        self._json(
-            200,
-            {
-                "protocol_version": 1,
-                "request_id": "req-1",
-                "status_code": status_code,
-                "reason_phrase": reason_phrase,
-                "headers": headers,
-                "body_base64": base64.b64encode(response_body).decode(),
-                "url": payload["url"],
-                "http_version": protocol,
-                "elapsed_ms": 12.5,
-                "trace": trace,
-                "dump": dump,
-            },
-        )
+        envelope = {
+            "protocol_version": 1,
+            "request_id": "req-1",
+            "status_code": status_code,
+            "reason_phrase": reason_phrase,
+            "headers": headers,
+            "body_base64": base64.b64encode(response_body).decode(),
+            "url": payload["url"],
+            "http_version": protocol,
+            "elapsed_ms": 12.5,
+        }
+        if trace is not None:
+            envelope["trace"] = trace
+        if dump is not None:
+            envelope["dump"] = dump
+        self._json(200, envelope)
 
     def do_DELETE(self):
         self._record()
@@ -611,6 +611,36 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(service_error.request_id, "req-e")
         self.assertEqual(service_error.request.url, httpx.URL("https://target.test/a"))
 
+    def test_canonical_v1_omits_optional_diagnostics_and_rejects_null(self):
+        envelope = {
+            "protocol_version": 1,
+            "request_id": "req-canonical",
+            "status_code": 204,
+            "reason_phrase": "No Content",
+            "headers": [],
+            "body_base64": "",
+            "url": "https://target.test/a",
+            "http_version": "HTTP/1.1",
+            "elapsed_ms": 1,
+        }
+        self.state.request_response = (200, json.dumps(envelope).encode(), "application/json")
+        with Client(go_endpoint=self.endpoint) as client:
+            response = client.get("https://target.test/a")
+        self.assertNotIn("go_trace", response.extensions)
+        self.assertNotIn("go_dump", response.extensions)
+
+        invalid_payloads = [
+            {**envelope, "trace": None},
+            {"error": {"code": "INVALID_REQUEST", "message": "bad", "retryable": False, "request_id": None}},
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                self.state.request_response = (400 if "error" in payload else 200, json.dumps(payload).encode(), "application/json")
+                with Client(go_endpoint=self.endpoint) as client:
+                    with self.assertRaises(GoProtocolError) as caught:
+                        client.get("https://target.test/a")
+                self.assertIsNone(caught.exception.code)
+
     def test_response_headers_and_reason_reject_protocol_injection(self):
         envelope = {
             "protocol_version": 1,
@@ -622,8 +652,6 @@ class ClientTests(unittest.TestCase):
             "url": "https://target.test/a",
             "http_version": "HTTP/1.1",
             "elapsed_ms": 1,
-            "trace": None,
-            "dump": None,
         }
         mutations = [
             ("headers", [["Bad Name", "value"]]),

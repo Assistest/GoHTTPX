@@ -135,7 +135,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`Client` 和 `AsyncClient` 的 Go 特有构造参数为 `go_endpoint`、`go_token`、`client_options`、`tls_fingerprint`、`impersonate`，并支持把 HTTPX 的 `verify`、`cert`、`proxy`、`http1`、`http2` 转换为 Go 配置。当前公开签名还接受 HTTPX 的 `auth`、`params`、`headers`、`cookies`、`timeout`、`follow_redirects`、`max_redirects`、`event_hooks`、`base_url`、`default_encoding`。`transport` 与 `mounts` 明确禁止，避免绕过 Go Transport；当前签名没有 `limits` 或 `trust_env` 参数，控制连接固定不读取代理环境变量。
+`Client` 和 `AsyncClient` 的会话配置入口是 `client_options=ClientOptions(...)`；`tls_fingerprint`、`impersonate`、`verify`、`cert`、`proxy`、`http1`、`http2` 是当前签名支持的固定会话便利参数。单次 `RequestOptions` 不属于构造参数，只能放在 `extensions={"go_req": ...}`。公开签名还接受 HTTPX 的 `auth`、`params`、`headers`、`cookies`、`timeout`、`follow_redirects`、`max_redirects`、`event_hooks`、`base_url`、`default_encoding`；`transport` 与 `mounts` 明确禁止，避免绕过 Go Transport。
+
+当前签名正式不提供 `limits` 或 `trust_env` 便利参数。HTTPX 的全局/按 URL 环境代理规则无法无损映射到一个配置固定的 Go session，控制连接也固定不读取代理环境变量；连接池和固定代理分别使用 `ClientOptions.transport` 与 `ClientOptions.proxy_url` 显式配置。`proxy=` 便利参数同样只生成一个固定会话代理，不表示支持环境代理或 per-URL mounts。
 
 `go_token=None` 时读取 `GOHTTPX_TOKEN`；显式字符串（包括空字符串）不再读取环境变量。
 
@@ -281,7 +283,7 @@ for client in (http1, http2, http3, h2c):
 
 | 字段 | 类型 | 默认 | 边界/含义 | HTTP/3 |
 |---|---|---:|---|---|
-| `header_order` | `tuple[str, ...]` | `()` | HTTP header 顺序提示 | 非空拒绝。 |
+| `header_order` | `tuple[str, ...]` | `()` | 非空时覆盖 HTTP header 名称分组顺序；为空时按 HTTPX prepared headers 的首次出现顺序自动设置 | 非空拒绝。 |
 | `pseudo_header_order` | `tuple[str, ...]` | `()` | HTTP/2 pseudo-header 顺序提示 | 非空拒绝。 |
 | `force_chunked` | `bool` | `False` | 强制 chunked encoding | true 拒绝。 |
 | `close_connection` | `bool` | `False` | 请求后关闭连接 | true 拒绝。 |
@@ -311,6 +313,14 @@ with Client(go_token="secret") as client:
 
 `go_trace` 在启用时包含且仅包含：`dns_lookup_ms`、`connect_ms`、`tls_handshake_ms`、`first_byte_ms`、`response_ms`、`total_ms`、`connection_reused`、`remote_address`。`go_dump` 只在启用 dump 时存在，可能含目标 headers 和 body，调用方必须按敏感诊断数据保护；Go 服务不记录请求日志。
 
+## 控制协议与 header 契约
+
+两个控制 POST（创建会话、发起请求）必须使用 `application/json`；允许合法的参数（例如 `charset=UTF-8`），media type 大小写不敏感。缺失或错误类型返回 415 `UNSUPPORTED_MEDIA_TYPE`，语法畸形返回 400 `INVALID_REQUEST`，均为 JSON error envelope。无正文的 GET/DELETE 不要求 Content-Type。
+
+v1 JSON 在任何层级都禁止 `null`，每个对象拒绝未知 key。创建请求的必需 key 是 `protocol_version`，其余预定义 `ClientOptions` key 可省略；目标请求的必需 key 是 `protocol_version`、`method`、`url`，预定义的 `headers`、`body_base64`、`timeout_ms`、`options` 可省略并采用空/零值。成功目标响应的必需 key 是 `protocol_version`、`request_id`、`status_code`、`reason_phrase`、`headers`、`body_base64`、`url`、`http_version`、`elapsed_ms`，可选 key 仅为 `trace`、`dump`，未启用时省略。错误对象必需 `code`、`message`、`retryable`，可选 `request_id` 只在已生成请求 ID 时出现；健康、能力和创建响应均使用各自文档列出的 exact keys。
+
+目标请求进入 req 最终 RoundTrip 前会从每请求 context 深拷贝恢复 HTTPX prepared headers，不会在线上补出调用方没有的业务 `User-Agent` 或 `Content-Type`。HTTP/1 对普通 header 保留首次出现的 key casing、同名重复值顺序和名称分组顺序；非空 `go_req.header_order` 覆盖自动顺序。`Host`、`User-Agent`、`Content-Length`、`Transfer-Encoding` 等由 req/Go 按协议特殊处理，不能视为任意原始 TCP 重放；HTTP/2 和 HTTP/3 的字段名按协议转为小写。响应侧 `net/http` 只能可靠保留值与重复值，不承诺原始 casing 或全局线序；当前 response envelope 按 canonical header 名排序。
+
 ## 错误映射与会话重建
 
 | 场景/Go code | Python 异常 | retryable 字段 |
@@ -322,6 +332,7 @@ with Client(go_token="secret") as client:
 | `UPSTREAM_TLS_ERROR` | `httpx.ConnectError` | `false` |
 | `UPSTREAM_PROTOCOL_ERROR` | `httpx.RemoteProtocolError` | `false` |
 | `INVALID_REQUEST` | `GoProtocolError` | `false` |
+| `UNSUPPORTED_MEDIA_TYPE` | `GoProtocolError` | `false` |
 | `UNAUTHORIZED` | `GoProtocolError` | `false` |
 | `PROTOCOL_MISMATCH` | `GoProtocolError` | `false` |
 | `UNSUPPORTED_FEATURE` | `GoProtocolError` | `false` |
@@ -341,7 +352,7 @@ with Client(go_token="secret") as client:
 - 每个目标请求最多 256 个 headers；单个名字最多 256 bytes，单个值最多 16384 bytes，总计最多 1 MiB。header 使用 Latin-1 无损映射。
 - 任意 callback、middleware、hook、response transformer、自定义 dial/TLS handshake/proxy 函数、自定义 marshal、`io.Reader`/`io.Writer`、进度回调都不能跨进程。桥接内部为 uTLS+mTLS 使用的固定 handshake 不对调用方开放。
 - Go 不持久化业务 cookies/headers/auth，不跟随 redirect，不使用 CookieJar，不自动字符集转换。
-- `Host`、`Content-Length`、连接复用和 HTTP/2 帧仍受 req 与 Go Transport 控制；本项目不承诺任意原始 TCP 报文重放。
+- `Host`、`User-Agent`、`Content-Length`、`Transfer-Encoding`、连接复用和 HTTP/2 帧仍受 req 与 Go Transport 控制；普通请求 header 的契约以上述“控制协议与 header 契约”为准，不扩展为任意原始 TCP 报文重放。
 - 鉴权仅面向本机 loopback bearer；控制 token 不进入目标请求。
 - Go 服务不输出启动日志或请求日志。控制面错误直接返回 JSON error envelope，Python 映射为带原始 request 的 HTTPX/`GoProtocolError` 异常，页面层可直接捕获并展示。
 
@@ -351,7 +362,7 @@ Go 服务应由进程管理器或运维脚本手动常驻启动；Python 进程�
 
 两个同步 Client 构造完成后立即对应两个独立 Go session；两个异步 AsyncClient 则在各自第一次请求后才分别拥有独立 session。关闭一个已创建会话的 client 会幂等删除它自己的 session，不影响另一个 client。服务重启导致 session 丢失时，下一次请求按上述 `CLIENT_NOT_FOUND` 规则重建。
 
-v1 发布后，`/api/v1` 的 exact request/response/error envelopes 不得增加或删除字段，不得改名、改类型、改变默认值或语义。任何协议扩展必须使用新的 `protocol_version` 与 endpoint，或同步升级 Go 服务和 Python SDK 后再发布，不能让单边先接受新字段。Python 包版本与 protocol 版本独立，当前 server/Python 版本均为 `1.0.0`。
+v1 发布后，`/api/v1` 的 required/optional key 集合、字段名、类型、默认值和语义保持稳定；optional key 可按约定省略，其他未知 key 一律拒绝。任何协议扩展必须使用新的 `protocol_version` 与 endpoint，或同步升级 Go 服务和 Python SDK 后再发布，不能让单边先接受新字段。Python 包版本与 protocol 版本独立，当前 server/Python 版本均为 `1.0.0`。
 
 ## 测试与离线 E2E
 

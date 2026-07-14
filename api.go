@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -62,11 +63,12 @@ func versionLine() string {
 
 var errUnsupportedTLSFingerprint = errors.New("unsupported TLS fingerprint")
 
-type requestContentTypeStateKey struct{}
+type requestHeaderStateKey struct{}
 
-type requestContentTypeState struct {
-	present bool
-	values  []string
+type requestHeaderState struct {
+	headers           http.Header
+	headerOrder       []string
+	pseudoHeaderOrder []string
 }
 
 var fingerprints = map[string]utls.ClientHelloID{
@@ -401,7 +403,7 @@ type responseEnvelope struct {
 	URL             string         `json:"url"`
 	HTTPVersion     string         `json:"http_version"`
 	ElapsedMS       float64        `json:"elapsed_ms"`
-	Trace           *responseTrace `json:"trace"`
+	Trace           *responseTrace `json:"trace,omitempty"`
 	Dump            *string        `json:"dump,omitempty"`
 }
 
@@ -446,10 +448,30 @@ func (s *server) routes() http.Handler {
 		writeJSON(w, http.StatusOK, healthResponse{Status: "ok", ProtocolVersion: protocolVersion, ServerVersion: serverVersion})
 	})
 	mux.Handle("GET /api/v1/capabilities", s.authenticate(http.HandlerFunc(s.handleCapabilities)))
-	mux.Handle("POST /api/v1/clients", s.authenticate(http.HandlerFunc(s.handleCreateClient)))
+	mux.Handle("POST /api/v1/clients", s.authenticate(requireJSONContentType(http.HandlerFunc(s.handleCreateClient))))
 	mux.Handle("DELETE /api/v1/clients/{clientID}", s.authenticate(http.HandlerFunc(s.handleDeleteClient)))
-	mux.Handle("POST /api/v1/clients/{clientID}/requests", s.authenticate(http.HandlerFunc(s.handleRawRequest)))
+	mux.Handle("POST /api/v1/clients/{clientID}/requests", s.authenticate(requireJSONContentType(http.HandlerFunc(s.handleRawRequest))))
 	return mux
+}
+
+func requireJSONContentType(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		value := r.Header.Get("Content-Type")
+		if value == "" {
+			writeJSON(w, http.StatusUnsupportedMediaType, errorResponse{Error: apiError{Code: "UNSUPPORTED_MEDIA_TYPE", Message: "Content-Type must be application/json"}})
+			return
+		}
+		mediaType, _, err := mime.ParseMediaType(value)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: apiError{Code: "INVALID_REQUEST", Message: "invalid Content-Type"}})
+			return
+		}
+		if !strings.EqualFold(mediaType, "application/json") {
+			writeJSON(w, http.StatusUnsupportedMediaType, errorResponse{Error: apiError{Code: "UNSUPPORTED_MEDIA_TYPE", Message: "Content-Type must be application/json"}})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *server) authenticate(next http.Handler) http.Handler {
@@ -621,26 +643,34 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 	targetReq := session.client.R()
-	if targetReq.Headers == nil {
-		targetReq.Headers = make(http.Header)
-	}
-	contentType := requestContentTypeState{}
+	originalHeaders := make(http.Header)
+	automaticOrder := make([]string, 0, len(headers))
+	originalHeaderNames := make(map[string]string, len(headers))
 	for _, pair := range headers {
-		targetReq.Headers.Add(pair[0], pair[1])
-		if strings.EqualFold(pair[0], "Content-Type") {
-			contentType.present = true
-			contentType.values = append(contentType.values, pair[1])
+		foldedName := strings.ToLower(pair[0])
+		name, seen := originalHeaderNames[foldedName]
+		if !seen {
+			name = pair[0]
+			if foldedName == "host" {
+				name = "Host"
+			}
+			originalHeaderNames[foldedName] = name
+			automaticOrder = append(automaticOrder, name)
 		}
+		originalHeaders[name] = append(originalHeaders[name], pair[1])
 	}
-	contentType.values = append([]string(nil), contentType.values...)
-	ctx = context.WithValue(ctx, requestContentTypeStateKey{}, contentType)
-	targetReq.SetContext(ctx)
+	headerOrder := automaticOrder
 	if len(input.Options.HeaderOrder) > 0 {
-		targetReq.SetHeaderOrder(input.Options.HeaderOrder...)
+		headerOrder = input.Options.HeaderOrder
 	}
-	if len(input.Options.PseudoHeaderOrder) > 0 {
-		targetReq.SetPseudoHeaderOrder(input.Options.PseudoHeaderOrder...)
+	headerState := requestHeaderState{
+		headers:           originalHeaders.Clone(),
+		headerOrder:       append([]string(nil), headerOrder...),
+		pseudoHeaderOrder: append([]string(nil), input.Options.PseudoHeaderOrder...),
 	}
+	ctx = context.WithValue(ctx, requestHeaderStateKey{}, headerState)
+	targetReq.Headers = originalHeaders.Clone()
+	targetReq.SetContext(ctx)
 	if len(body) > 0 {
 		targetReq.SetBodyBytes(body)
 	}
@@ -940,10 +970,16 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 	client.GetClient().Timeout = 0
 	client.WrapRoundTripFunc(func(next req.RoundTripper) req.RoundTripFunc {
 		return func(request *req.Request) (*req.Response, error) {
-			if contentType, ok := request.Context().Value(requestContentTypeStateKey{}).(requestContentTypeState); ok {
-				request.Headers.Del("Content-Type")
-				if contentType.present {
-					request.Headers["Content-Type"] = append([]string(nil), contentType.values...)
+			if state, ok := request.Context().Value(requestHeaderStateKey{}).(requestHeaderState); ok {
+				request.Headers = state.headers.Clone()
+				if _, canonicalUserAgent := request.Headers["User-Agent"]; !canonicalUserAgent {
+					request.Headers["User-Agent"] = nil
+				}
+				if len(state.headerOrder) > 0 {
+					request.Headers[req.HeaderOderKey] = append([]string(nil), state.headerOrder...)
+				}
+				if len(state.pseudoHeaderOrder) > 0 {
+					request.Headers[req.PseudoHeaderOderKey] = append([]string(nil), state.pseudoHeaderOrder...)
 				}
 			}
 			return next.RoundTrip(request)

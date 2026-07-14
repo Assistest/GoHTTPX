@@ -269,6 +269,15 @@ def _decode_json(response: httpx.Response, request: httpx.Request | None) -> dic
         )
     except (UnicodeDecodeError, ValueError, TypeError) as exc:
         raise GoProtocolError("Go 服务返回了非法 JSON", request=request) from exc
+    pending = [decoded]
+    while pending:
+        value = pending.pop()
+        if value is None:
+            raise GoProtocolError("Go 服务返回的 JSON 含 null", request=request)
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
     if not isinstance(decoded, dict):
         raise GoProtocolError("Go 服务返回的 JSON envelope 不是对象", request=request)
     return decoded
@@ -578,9 +587,8 @@ class _GoTransport(httpx.BaseTransport):
             "url",
             "http_version",
             "elapsed_ms",
-            "trace",
         }
-        if not required.issubset(data) or set(data) - required - {"dump"} or "error" in data:
+        if not required.issubset(data) or set(data) - required - {"trace", "dump"} or "error" in data:
             raise GoProtocolError("Go 请求响应缺少必需字段", request=request)
         if type(data["protocol_version"]) is not int or data["protocol_version"] != 1:
             raise GoProtocolError("Go 请求响应的 protocol_version 非 v1", request=request)
@@ -622,7 +630,7 @@ class _GoTransport(httpx.BaseTransport):
         except (UnicodeEncodeError, ValueError, TypeError) as exc:
             raise GoProtocolError("Go 请求响应的 header、正文或 reason 非法", request=request) from exc
 
-        trace = data["trace"]
+        trace = data.get("trace")
         if trace is not None:
             trace_fields = {
                 "dns_lookup_ms",

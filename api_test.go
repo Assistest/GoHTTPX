@@ -160,6 +160,54 @@ func TestCapabilitiesRequiresToken(t *testing.T) {
 	}
 }
 
+func TestControlPOSTRequiresJSONContentType(t *testing.T) {
+	s := newServer("", 48<<20, time.Hour)
+	t.Cleanup(s.Close)
+	handler := s.routes()
+	endpoints := []struct {
+		path        string
+		body        string
+		validStatus int
+	}{
+		{path: "/api/v1/clients", body: `{"protocol_version":1}`, validStatus: http.StatusCreated},
+		{path: "/api/v1/clients/missing/requests", body: `{}`, validStatus: http.StatusNotFound},
+	}
+	invalid := []struct {
+		name        string
+		contentType string
+		status      int
+		code        string
+	}{
+		{name: "missing", status: http.StatusUnsupportedMediaType, code: "UNSUPPORTED_MEDIA_TYPE"},
+		{name: "wrong", contentType: "text/plain", status: http.StatusUnsupportedMediaType, code: "UNSUPPORTED_MEDIA_TYPE"},
+		{name: "malformed", contentType: "application/json; charset", status: http.StatusBadRequest, code: "INVALID_REQUEST"},
+	}
+	for _, endpoint := range endpoints {
+		for _, test := range invalid {
+			t.Run(endpoint.path+"/"+test.name, func(t *testing.T) {
+				request := httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(endpoint.body))
+				if test.contentType != "" {
+					request.Header.Set("Content-Type", test.contentType)
+				}
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				if response.Code != test.status || response.Header().Get("Content-Type") != "application/json" || decodeAPIError(t, response).Code != test.code {
+					t.Fatalf("status=%d content-type=%q body=%s", response.Code, response.Header().Get("Content-Type"), response.Body.String())
+				}
+			})
+		}
+		t.Run(endpoint.path+"/valid", func(t *testing.T) {
+			request := newJSONControlRequest(endpoint.path, strings.NewReader(endpoint.body))
+			request.Header.Set("Content-Type", "Application/JSON; Charset=UTF-8")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != endpoint.validStatus {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestFingerprintCatalogHasAndroidDefault(t *testing.T) {
 	if _, ok := fingerprints["android_11_okhttp"]; !ok {
 		t.Fatal("missing android_11_okhttp")
@@ -191,7 +239,7 @@ func TestClientLifecycleUsesDefaultFingerprintAndDeleteIsIdempotent(t *testing.T
 	s := newServer("", 48<<20, time.Hour)
 	handler := s.routes()
 	created := httptest.NewRecorder()
-	handler.ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1}`)))
+	handler.ServeHTTP(created, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1}`)))
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
 	}
@@ -228,7 +276,7 @@ func TestClientLifecycleUsesDefaultFingerprintAndDeleteIsIdempotent(t *testing.T
 func TestClientLifecycleRejectsUnsupportedFingerprint(t *testing.T) {
 	s := newServer("", 48<<20, time.Hour)
 	response := httptest.NewRecorder()
-	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"tls_fingerprint":"not-a-fingerprint"}`)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"tls_fingerprint":"not-a-fingerprint"}`)))
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
@@ -251,7 +299,7 @@ func TestClientLifecycleRejectsNonConfigurationJSON(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := newServer("", 48<<20, time.Hour)
 			response := httptest.NewRecorder()
-			s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(body)))
+			s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(body)))
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 			}
@@ -373,6 +421,12 @@ func addTestClient(t *testing.T, s *server) string {
 	return clientID
 }
 
+func newJSONControlRequest(target string, body io.Reader) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, target, body)
+	request.Header.Set("Content-Type", "application/json")
+	return request
+}
+
 func sendRawRequest(t *testing.T, handler http.Handler, clientID string, input requestEnvelope) *httptest.ResponseRecorder {
 	t.Helper()
 	if input.Headers == nil {
@@ -383,7 +437,8 @@ func sendRawRequest(t *testing.T, handler http.Handler, clientID string, input r
 		t.Fatal(err)
 	}
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", bytes.NewReader(body)))
+	request := newJSONControlRequest("/api/v1/clients/"+clientID+"/requests", bytes.NewReader(body))
+	handler.ServeHTTP(response, request)
 	return response
 }
 
@@ -454,6 +509,95 @@ func TestRawRequestPreservesDuplicateHeadersAndBinaryBodies(t *testing.T) {
 	}
 }
 
+func TestRawRequestHTTP1PreservesPreparedHeaderWireContract(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	captured := make(chan string, 2)
+	serverErrors := make(chan error, 1)
+	go func() {
+		for range 2 {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				serverErrors <- acceptErr
+				return
+			}
+			_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+			reader := bufio.NewReader(connection)
+			var raw strings.Builder
+			for {
+				line, readErr := reader.ReadString('\n')
+				if readErr != nil {
+					_ = connection.Close()
+					serverErrors <- readErr
+					return
+				}
+				raw.WriteString(line)
+				if line == "\r\n" {
+					break
+				}
+			}
+			captured <- raw.String()
+			_, _ = connection.Write([]byte("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"))
+			_ = connection.Close()
+		}
+	}()
+
+	s := newServer("", 48<<20, time.Hour)
+	t.Cleanup(s.Close)
+	client, err := buildReqClient(createClientRequest{HTTPVersion: "http1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientID = "raw-header-client"
+	s.clients[clientID] = &clientSession{client: client, lastUsed: time.Now()}
+	targetURL := "http://" + listener.Addr().String()
+	tests := []requestEnvelope{
+		{
+			ProtocolVersion: protocolVersion,
+			Method:          http.MethodPost,
+			URL:             targetURL,
+			Headers:         [][2]string{{"X-Second", "2"}, {"x-Repeat", "one"}, {"x-Repeat", "two"}, {"X-First", "1"}},
+			BodyBase64:      base64.StdEncoding.EncodeToString([]byte("payload")),
+		},
+		{
+			ProtocolVersion: protocolVersion,
+			Method:          http.MethodGet,
+			URL:             targetURL,
+			Headers:         [][2]string{{"X-First", "1"}, {"x-Second", "2"}},
+			Options:         requestOptions{HeaderOrder: []string{"x-Second", "X-First"}},
+		},
+	}
+	for _, input := range tests {
+		response := sendRawRequest(t, s.routes(), clientID, input)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+
+	first, second := <-captured, <-captured
+	select {
+	case serverErr := <-serverErrors:
+		t.Fatal(serverErr)
+	default:
+	}
+	firstLower := strings.ToLower(first)
+	if strings.Contains(firstLower, "\r\nuser-agent:") || strings.Contains(firstLower, "\r\ncontent-type:") {
+		t.Fatalf("unexpected synthesized business header:\n%s", first)
+	}
+	secondIndex := strings.Index(first, "\r\nX-Second: 2\r\n")
+	repeatIndex := strings.Index(first, "\r\nx-Repeat: one\r\nx-Repeat: two\r\n")
+	firstIndex := strings.Index(first, "\r\nX-First: 1\r\n")
+	if secondIndex < 0 || repeatIndex < 0 || firstIndex < 0 || !(secondIndex < repeatIndex && repeatIndex < firstIndex) {
+		t.Fatalf("automatic header order/casing/duplicates lost:\n%s", first)
+	}
+	if secondIndex = strings.Index(second, "\r\nx-Second: 2\r\n"); secondIndex < 0 || strings.Index(second, "\r\nX-First: 1\r\n") < secondIndex {
+		t.Fatalf("explicit header order ignored:\n%s", second)
+	}
+}
+
 func TestRawRequestConcurrentContentTypePresenceIsIsolated(t *testing.T) {
 	type observedRequest struct {
 		path        string
@@ -498,7 +642,7 @@ func TestRawRequestConcurrentContentTypePresenceIsIsolated(t *testing.T) {
 					BodyBase64:      base64.StdEncoding.EncodeToString([]byte("payload")),
 				})
 				response := httptest.NewRecorder()
-				handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", bytes.NewReader(input)))
+				handler.ServeHTTP(response, newJSONControlRequest("/api/v1/clients/"+clientID+"/requests", bytes.NewReader(input)))
 				if response.Code != http.StatusOK {
 					errors <- response.Body.String()
 				}
@@ -720,7 +864,7 @@ func TestRequestValidation(t *testing.T) {
 			s := newServer("", 48<<20, time.Hour)
 			clientID := addTestClient(t, s)
 			response := httptest.NewRecorder()
-			s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", strings.NewReader(body)))
+			s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients/"+clientID+"/requests", strings.NewReader(body)))
 			if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
 				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 			}
@@ -740,7 +884,7 @@ func TestRequestValidation(t *testing.T) {
 			clientID := addTestClient(t, s)
 			body := `{"protocol_version":1,"method":"GET","url":"` + target.URL + `","headers":` + headers + `}`
 			response := httptest.NewRecorder()
-			s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", strings.NewReader(body)))
+			s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients/"+clientID+"/requests", strings.NewReader(body)))
 			if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
 				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 			}
@@ -778,7 +922,7 @@ func TestRawRequestTracksActiveCalls(t *testing.T) {
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		response := httptest.NewRecorder()
-		s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients/"+clientID+"/requests", bytes.NewReader(body)))
+		s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients/"+clientID+"/requests", bytes.NewReader(body)))
 		done <- response
 	}()
 	<-started
@@ -1345,12 +1489,12 @@ func TestClientOptionsHTTP3MapsOnlyEquivalentConfiguration(t *testing.T) {
 
 	s := newServer("", 48<<20, time.Hour)
 	response := httptest.NewRecorder()
-	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3","transport":{"read_buffer_size":1}}`)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3","transport":{"read_buffer_size":1}}`)))
 	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "read_buffer_size") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 	response = httptest.NewRecorder()
-	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3","transport":{"proxy_connect_headers":{}},"http2":{"connection_flow":0,"max_header_list_size":0}}`)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3","transport":{"proxy_connect_headers":{}},"http2":{"connection_flow":0,"max_header_list_size":0}}`)))
 	if response.Code != http.StatusCreated {
 		t.Fatalf("default-valued HTTP/3 options rejected: status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -1359,7 +1503,7 @@ func TestClientOptionsHTTP3MapsOnlyEquivalentConfiguration(t *testing.T) {
 func createHTTP3Session(t *testing.T, s *server) (string, *http3.Transport) {
 	t.Helper()
 	created := httptest.NewRecorder()
-	s.routes().ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3"}`)))
+	s.routes().ServeHTTP(created, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"http_version":"http3"}`)))
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
 	}
@@ -1478,7 +1622,7 @@ func TestClientOptionsCreateLimit(t *testing.T) {
 	s := newServer("", 48<<20, time.Hour)
 	response := httptest.NewRecorder()
 	body := `{"protocol_version":1,"root_ca_pem":"` + strings.Repeat("a", 4<<20) + `"}`
-	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(body)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(body)))
 	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "4194304") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -1512,7 +1656,7 @@ func TestClientOptionsRejectNullAndInvalidRootCAPEM(t *testing.T) {
 	} {
 		s := newServer("", 48<<20, time.Hour)
 		response := httptest.NewRecorder()
-		s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(body)))
+		s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(body)))
 		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
 			t.Fatalf("null accepted: %s response=%s", body, response.Body.String())
 		}
@@ -1611,7 +1755,7 @@ func TestClientOptionsRejectIgnoredRetryFields(t *testing.T) {
 func TestCreateClientRejectsIgnoredRetryField(t *testing.T) {
 	s := newServer("", 48<<20, time.Hour)
 	response := httptest.NewRecorder()
-	s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(`{"protocol_version":1,"retry":{"count":1,"mode":"fixed","fixed_interval_ms":1,"backoff_min_ms":1}}`)))
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"retry":{"count":1,"mode":"fixed","fixed_interval_ms":1,"backoff_min_ms":1}}`)))
 	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "retry.backoff_min_ms") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -1627,7 +1771,7 @@ func TestClientOptionsStrictNestedJSONAndInvalidConfigurationCode(t *testing.T) 
 	} {
 		s := newServer("", 48<<20, time.Hour)
 		response := httptest.NewRecorder()
-		s.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/clients", strings.NewReader(body)))
+		s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(body)))
 		if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
 			t.Fatalf("body=%s status=%d response=%s", body, response.Code, response.Body.String())
 		}
@@ -1694,7 +1838,7 @@ func TestRequestOptionsValidateRetryOverride(t *testing.T) {
 	}
 }
 
-func TestRequestOptionsOmitDisabledDump(t *testing.T) {
+func TestRequestOptionsOmitDisabledDiagnostics(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -1705,8 +1849,10 @@ func TestRequestOptionsOmitDisabledDump(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &wire); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := wire["dump"]; ok {
-		t.Fatalf("disabled dump must be omitted: %s", response.Body.String())
+	for _, field := range []string{"trace", "dump"} {
+		if _, ok := wire[field]; ok {
+			t.Fatalf("disabled %s must be omitted: %s", field, response.Body.String())
+		}
 	}
 }
 
