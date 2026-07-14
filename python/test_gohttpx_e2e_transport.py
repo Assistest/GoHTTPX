@@ -1,12 +1,13 @@
 import os
 import subprocess
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
 
-from e2e_support import GoHTTPXService, TransportTarget
-from gohttpx import Client, ClientOptions, GoProtocolError, Impersonate, TLSFingerprint
+from e2e_support import ConnectProxyFixture, GoHTTPXService, Socks5ProxyFixture, TransportTarget
+from gohttpx import Client, ClientOptions, GoProtocolError, Impersonate, TLSFingerprint, TransportOptions
 
 
 class TransportE2ETests(unittest.TestCase):
@@ -41,6 +42,58 @@ class TransportE2ETests(unittest.TestCase):
         observed = response.json()
         self.assertTrue(observed["peer_cert_present"])
         self.assertIn(observed["protocol"], ("HTTP/1.1", "HTTP/2.0"))
+
+    def test_connect_proxy_forwards_auth_and_explicit_headers(self):
+        with ConnectProxyFixture("user", "pass") as proxy:
+            with Client(
+                go_endpoint=self.service.endpoint,
+                go_token=self.service.token,
+                verify=self.target.ca_path,
+                proxy=f"http://user:pass@{proxy.hostport}",
+                client_options=ClientOptions(transport=TransportOptions(proxy_connect_headers={"X-Connect": ["one"]})),
+            ) as client:
+                response = client.get(self.target.https_endpoint + "/observe")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(proxy.calls), 1)
+        self.assertEqual(proxy.calls[0]["headers"]["Proxy-Authorization"], ["Basic dXNlcjpwYXNz"])
+        self.assertEqual(proxy.calls[0]["headers"]["X-Connect"], ["one"])
+
+    def test_invalid_connect_proxy_auth_maps_to_connect_error(self):
+        with ConnectProxyFixture("user", "pass") as proxy:
+            with Client(
+                go_endpoint=self.service.endpoint,
+                go_token=self.service.token,
+                verify=self.target.ca_path,
+                proxy=f"http://user:wrong@{proxy.hostport}",
+            ) as client:
+                with self.assertRaises(httpx.ConnectError) as caught:
+                    client.get(self.target.https_endpoint + "/observe")
+
+        self.assertEqual(caught.exception.code, "UPSTREAM_CONNECT_ERROR")
+        self.assertEqual(len(proxy.calls), 1)
+
+    def test_socks5_proxy_forwards_concurrent_bounded_large_bodies(self):
+        body = b"x" * (1024 * 1024)
+        with Socks5ProxyFixture() as proxy:
+            clients = [
+                Client(
+                    go_endpoint=self.service.endpoint,
+                    go_token=self.service.token,
+                    proxy=f"socks5://{proxy.hostport}",
+                )
+                for _ in range(4)
+            ]
+            try:
+                with ThreadPoolExecutor(max_workers=len(clients)) as executor:
+                    responses = list(executor.map(lambda client: client.post(self.target.http_endpoint + "/observe", content=body), clients))
+            finally:
+                for client in clients:
+                    client.close()
+
+        self.assertEqual([response.status_code for response in responses], [200] * len(clients))
+        self.assertEqual([response.json()["body_length"] for response in responses], [len(body)] * len(clients))
+        self.assertEqual(len(proxy.calls), len(clients))
 
     def test_http1_http2_h2c_and_http3_reach_their_real_protocol_targets(self):
         cases = (

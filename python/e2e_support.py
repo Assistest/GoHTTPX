@@ -2,7 +2,9 @@ import base64
 import ipaddress
 import json
 import os
+import select
 import socket
+import socketserver
 import subprocess
 import tempfile
 import threading
@@ -38,6 +40,162 @@ def wait_for_health(endpoint, process):
             pass
         time.sleep(0.05)
     raise RuntimeError(f"Go 服务 health 超时，exit code={process.poll()}")
+
+
+def _is_loopback_destination(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        try:
+            return host.lower() == "localhost" and all(ipaddress.ip_address(item[4][0]).is_loopback for item in socket.getaddrinfo(host, None))
+        except (OSError, ValueError):
+            return False
+
+
+def _relay(left, right):
+    try:
+        while True:
+            ready, _, _ = select.select((left, right), (), (), 0.2)
+            if not ready:
+                continue
+            for source in ready:
+                data = source.recv(65536)
+                if not data:
+                    return
+                (right if source is left else left).sendall(data)
+    except OSError:
+        pass
+    finally:
+        for connection in (left, right):
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+
+
+class ConnectProxyFixture:
+    def __init__(self, username=None, password=None):
+        self.calls = []
+        self.lock = threading.Lock()
+        self.expected_authorization = None if username is None else "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ConnectProxyHandler)
+        self.server.fixture = self
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.hostport = f"{host}:{port}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
+class _ConnectProxyHandler(BaseHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        pass
+
+    def do_CONNECT(self):
+        host, separator, port = self.path.rpartition(":")
+        headers = {name: self.headers.get_all(name) for name in self.headers}
+        fixture = self.server.fixture
+        with fixture.lock:
+            fixture.calls.append({"host": host, "port": int(port) if separator and port.isdigit() else None, "headers": headers})
+        if not separator or not port.isdigit() or not _is_loopback_destination(host):
+            self.send_error(403, "loopback destination required")
+            return
+        if fixture.expected_authorization is not None and self.headers.get("Proxy-Authorization") != fixture.expected_authorization:
+            self.send_response(407)
+            self.send_header("Proxy-Authenticate", 'Basic realm="loopback"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        try:
+            upstream = socket.create_connection((host, int(port)), timeout=5)
+        except OSError:
+            self.send_error(502)
+            return
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+        self.wfile.flush()
+        _relay(self.connection, upstream)
+
+
+class _Socks5Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class Socks5ProxyFixture:
+    def __init__(self):
+        self.calls = []
+        self.lock = threading.Lock()
+        self.server = _Socks5Server(("127.0.0.1", 0), _Socks5ProxyHandler)
+        self.server.fixture = self
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.hostport = f"{host}:{port}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
+class _Socks5ProxyHandler(socketserver.BaseRequestHandler):
+    def _read(self, length):
+        data = b""
+        while len(data) < length:
+            chunk = self.request.recv(length - len(data))
+            if not chunk:
+                raise ConnectionError("SOCKS5 client disconnected")
+            data += chunk
+        return data
+
+    def handle(self):
+        try:
+            version, count = self._read(2)
+            if version != 5:
+                return
+            self._read(count)
+            self.request.sendall(b"\x05\x00")
+            version, command, _reserved, address_type = self._read(4)
+            if version != 5 or command != 1:
+                return
+            if address_type == 1:
+                host = socket.inet_ntoa(self._read(4))
+            elif address_type == 3:
+                host = self._read(self._read(1)[0]).decode("idna")
+            elif address_type == 4:
+                host = socket.inet_ntop(socket.AF_INET6, self._read(16))
+            else:
+                return
+            port = int.from_bytes(self._read(2), "big")
+            fixture = self.server.fixture
+            with fixture.lock:
+                fixture.calls.append({"host": host, "port": port})
+            if not _is_loopback_destination(host):
+                self.request.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+                return
+            upstream = socket.create_connection((host, port), timeout=5)
+            self.request.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            _relay(self.request, upstream)
+        except (ConnectionError, OSError, UnicodeError):
+            pass
 
 
 class HTTPFixture:
