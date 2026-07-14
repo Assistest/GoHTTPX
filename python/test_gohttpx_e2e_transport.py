@@ -1,4 +1,5 @@
 import os
+import socket
 import subprocess
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -94,6 +95,29 @@ class TransportE2ETests(unittest.TestCase):
         self.assertEqual([response.status_code for response in responses], [200] * len(clients))
         self.assertEqual([response.json()["body_length"] for response in responses], [len(body)] * len(clients))
         self.assertEqual(len(proxy.calls), len(clients))
+
+    def test_proxy_fixtures_reject_nonloopback_destinations_without_dialing(self):
+        with ConnectProxyFixture() as proxy:
+            with socket.create_connection(("127.0.0.1", proxy.server.server_address[1]), timeout=1) as connection:
+                connection.sendall(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                self.assertIn(b" 403 ", connection.recv(1024))
+            self.assertEqual(proxy.calls[0]["host"], "example.com")
+            self.assertEqual(proxy.dialed_hosts, [])
+
+        with Socks5ProxyFixture() as proxy:
+            with socket.create_connection(("127.0.0.1", proxy.server.server_address[1]), timeout=1) as connection:
+                connection.sendall(b"\x05\x01\x00")
+                self.assertEqual(connection.recv(2), b"\x05\x00")
+                connection.sendall(b"\x05\x01\x00\x01\x08\x08\x08\x08\x01\xbb")
+                self.assertEqual(connection.recv(10)[1], 2)
+            self.assertEqual(proxy.calls[0]["host"], "8.8.8.8")
+            self.assertEqual(proxy.dialed_hosts, [])
+
+        with ConnectProxyFixture() as proxy:
+            with socket.create_connection(("127.0.0.1", proxy.server.server_address[1]), timeout=1) as connection:
+                connection.sendall(f"CONNECT localhost:{self.target.http_endpoint.rsplit(':', 1)[1]} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+                self.assertIn(b" 200 ", connection.recv(1024))
+            self.assertEqual(proxy.dialed_hosts, ["127.0.0.1"])
 
     def test_http1_http2_h2c_and_http3_reach_their_real_protocol_targets(self):
         cases = (

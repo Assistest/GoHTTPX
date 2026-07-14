@@ -42,14 +42,18 @@ def wait_for_health(endpoint, process):
     raise RuntimeError(f"Go 服务 health 超时，exit code={process.poll()}")
 
 
-def _is_loopback_destination(host):
+def _resolve_loopback_destination(host):
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
+        return str(address) if address.is_loopback else None
     except ValueError:
         try:
-            return host.lower() == "localhost" and all(ipaddress.ip_address(item[4][0]).is_loopback for item in socket.getaddrinfo(host, None))
+            addresses = [item[4][0] for item in socket.getaddrinfo(host, None)] if host.lower() == "localhost" else []
+            if not addresses or not all(ipaddress.ip_address(address).is_loopback for address in addresses):
+                return None
+            return next((address for address in addresses if ipaddress.ip_address(address).version == 4), addresses[0])
         except (OSError, ValueError):
-            return False
+            return None
 
 
 def _relay(left, right):
@@ -77,6 +81,7 @@ def _relay(left, right):
 class ConnectProxyFixture:
     def __init__(self, username=None, password=None):
         self.calls = []
+        self.dialed_hosts = []
         self.lock = threading.Lock()
         self.expected_authorization = None if username is None else "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ConnectProxyHandler)
@@ -108,7 +113,8 @@ class _ConnectProxyHandler(BaseHTTPRequestHandler):
         fixture = self.server.fixture
         with fixture.lock:
             fixture.calls.append({"host": host, "port": int(port) if separator and port.isdigit() else None, "headers": headers})
-        if not separator or not port.isdigit() or not _is_loopback_destination(host):
+        destination = _resolve_loopback_destination(host) if separator and port.isdigit() else None
+        if destination is None:
             self.send_error(403, "loopback destination required")
             return
         if fixture.expected_authorization is not None and self.headers.get("Proxy-Authorization") != fixture.expected_authorization:
@@ -118,7 +124,9 @@ class _ConnectProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         try:
-            upstream = socket.create_connection((host, int(port)), timeout=5)
+            with fixture.lock:
+                fixture.dialed_hosts.append(destination)
+            upstream = socket.create_connection((destination, int(port)), timeout=5)
         except OSError:
             self.send_error(502)
             return
@@ -136,6 +144,7 @@ class _Socks5Server(socketserver.ThreadingTCPServer):
 class Socks5ProxyFixture:
     def __init__(self):
         self.calls = []
+        self.dialed_hosts = []
         self.lock = threading.Lock()
         self.server = _Socks5Server(("127.0.0.1", 0), _Socks5ProxyHandler)
         self.server.fixture = self
@@ -188,10 +197,13 @@ class _Socks5ProxyHandler(socketserver.BaseRequestHandler):
             fixture = self.server.fixture
             with fixture.lock:
                 fixture.calls.append({"host": host, "port": port})
-            if not _is_loopback_destination(host):
+            destination = _resolve_loopback_destination(host)
+            if destination is None:
                 self.request.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
-            upstream = socket.create_connection((host, port), timeout=5)
+            with fixture.lock:
+                fixture.dialed_hosts.append(destination)
+            upstream = socket.create_connection((destination, port), timeout=5)
             self.request.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             _relay(self.request, upstream)
         except (ConnectionError, OSError, UnicodeError):

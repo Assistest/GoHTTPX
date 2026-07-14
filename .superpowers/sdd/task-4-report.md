@@ -28,3 +28,10 @@ ClientOptions(transport=TransportOptions(proxy_connect_headers={"X-Connect": ["o
 ```
 
 已按该契约测试，未新增或修改 `ClientOptions` 字段。
+
+## P2 修复：localhost 解析后的拨号边界
+
+- 根因：原先 loopback 校验只返回布尔值，`localhost` 校验通过后仍把原始主机名传给 `socket.create_connection`，存在解析结果变化时越过已验证地址的风险。
+- 修复：校验函数改为返回已验证的数值 loopback IP；CONNECT 和 SOCKS5 均只向该 IP 拨号。`localhost` 仅在全部解析结果都是 loopback 时允许，并优先选择 IPv4 数值地址。
+- 回归：原始 CONNECT `example.com` 与 SOCKS5 `8.8.8.8` 都被拒绝，`dialed_hosts` 保持为空；CONNECT `localhost` 的已记录拨号地址为 `127.0.0.1`。
+- 验证：transport discovery 与末尾 3 项复核均通过；完整 discovery 共 10 项。
