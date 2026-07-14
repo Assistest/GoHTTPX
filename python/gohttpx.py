@@ -163,8 +163,14 @@ class RequestOptions:
     retry_count: int | None = None
 
 
-class GoServiceUnavailable(httpx.TransportError):
-    pass
+class GoServiceUnavailable(httpx.ConnectError):
+    def __init__(
+        self,
+        message: str = "无法连接本地 Go 服务，请安装并启动服务：https://github.com/Assistest/GoHTTPX",
+        *,
+        request: httpx.Request | None = None,
+    ) -> None:
+        super().__init__(message, request=request)
 
 
 class GoProtocolError(httpx.TransportError):
@@ -453,7 +459,7 @@ class _GoTransport(httpx.BaseTransport):
                 timeout=control_timeout,
             )
         except httpx.TransportError as exc:
-            raise GoServiceUnavailable("无法连接本地 Go 服务", request=request) from exc
+            raise GoServiceUnavailable(request=request) from exc
         data = _decode_json(response, request)
         if response.status_code >= 400:
             _raise_service_error(data, request)
@@ -481,7 +487,7 @@ class _GoTransport(httpx.BaseTransport):
                 timeout=_LOCAL_CONTROL_TIMEOUT,
             )
         except httpx.TransportError as exc:
-            raise GoServiceUnavailable("删除 Go 会话时无法连接本地服务") from exc
+            raise GoServiceUnavailable() from exc
         if response.status_code >= 400:
             _raise_service_error(_decode_json(response, None), None)
         if response.status_code != 204:
@@ -740,7 +746,7 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
                 timeout=control_timeout,
             )
         except httpx.TransportError as exc:
-            raise GoServiceUnavailable("无法连接本地 Go 服务", request=request) from exc
+            raise GoServiceUnavailable(request=request) from exc
         data = _decode_json(response, request)
         if response.status_code >= 400:
             _raise_service_error(data, request)
@@ -757,7 +763,7 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
                 timeout=_LOCAL_CONTROL_TIMEOUT,
             )
         except httpx.TransportError as exc:
-            raise GoServiceUnavailable("删除 Go 会话时无法连接本地服务") from exc
+            raise GoServiceUnavailable() from exc
         if response.status_code >= 400:
             _raise_service_error(_decode_json(response, None), None)
         if response.status_code != 204:

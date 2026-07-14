@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
+import gohttpx
 
 from gohttpx import (
     __version__,
@@ -835,6 +836,19 @@ class ClientTests(unittest.TestCase):
                 ("DELETE", "/api/v1/clients/client-1"),
             ],
         )
+
+    def test_unavailable_service_has_github_guidance(self):
+        transport = gohttpx._GoTransport.__new__(gohttpx._GoTransport)
+        transport._endpoint = "http://127.0.0.1:1"
+        transport._control = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(httpx.ConnectError("down", request=request))
+            )
+        )
+        with self.assertRaises(GoServiceUnavailable) as caught:
+            transport._call("GET", "/api/v1/capabilities", None, None)
+        self.assertIsInstance(caught.exception, httpx.ConnectError)
+        self.assertIn("github.com/Assistest/GoHTTPX", str(caught.exception))
 
     def test_service_unavailable_and_control_client_ignores_environment_proxy(self):
         probe = ThreadingHTTPServer(("127.0.0.1", 0), FakeGoHandler)
