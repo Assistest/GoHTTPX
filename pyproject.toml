@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gohttpx"
-version = "1.0.0"
+version = "1.0.1"
 description = "通过本地 Go 服务扩展 HTTPX 请求能力"
 readme = "README.md"
 requires-python = ">=3.10"

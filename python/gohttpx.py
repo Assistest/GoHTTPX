@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 import httpx
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 
 class TLSFingerprint(str, Enum):
