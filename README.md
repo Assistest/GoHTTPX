@@ -6,7 +6,7 @@
 pip install gohttpx
 ```
 
-Go 服务端不属于 pip 包。请从 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases) 获取与 Python SDK 同标签的平台安装包，并校验随附 SHA-256 文件。Go 服务端不可达时会抛出 `GoServiceUnavailable`，消息会指向 Releases 地址。
+Go 服务端不属于 pip 包。请从 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases) 获取与 Python SDK 同标签的 Windows amd64 安装包，并校验随附 SHA-256 文件。Go 服务端不可达时会抛出 `GoServiceUnavailable`，消息会指向 Releases 地址。
 
 ```python
 from gohttpx import Client, GoServiceUnavailable

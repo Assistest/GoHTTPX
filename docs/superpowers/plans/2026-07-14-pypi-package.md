@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 将现有 Python 客户端发布为可通过 `pip install gohttpx` 安装的 PyPI 包，在本地 Go bridge 不可达时给出仓库引导，并通过同标签多平台 Go Release 与严格版本握手防止前后端混用。
+**Goal:** 将现有 Python 客户端发布为可通过 `pip install gohttpx` 安装的 PyPI 包，在本地 Go bridge 不可达时给出仓库引导，并通过同标签 Windows Go Release 与严格版本握手防止前后端混用。
 
-**Architecture:** 根目录的 `pyproject.toml` 将单文件模块 `python/gohttpx.py` 构建为 `gohttpx` 分发包。客户端仅在控制面连接异常时将 HTTPX 连接错误包装为带 GitHub 地址的 `GoServiceUnavailable`，其他 HTTPX 语义不变；创建会话时附带 SDK 版本，Go 服务端要求与构建版本完全一致。GitHub Actions 以同一个 `v*` 标签发布已验证的 wheel/sdist 与四个平台服务端附件。
+**Architecture:** 根目录的 `pyproject.toml` 将单文件模块 `python/gohttpx.py` 构建为 `gohttpx` 分发包。客户端仅在控制面连接异常时将 HTTPX 连接错误包装为带 GitHub 地址的 `GoServiceUnavailable`，其他 HTTPX 语义不变；创建会话时附带 SDK 版本，Go 服务端要求与构建版本完全一致。GitHub Actions 以同一个 `v*` 标签发布已验证的 wheel/sdist 与 Windows amd64 服务端附件。
 
 **Tech Stack:** Python 3.10+、setuptools、build、twine、HTTPX 0.28.x、GitHub Actions、PyPI Trusted Publishing。
 
@@ -15,7 +15,7 @@
 - wheel 不包含、下载或启动 Go 二进制；Go 服务仍由用户手工常驻运行。
 - 仅 bridge 控制面不可连接时提供引导；目标站点错误保留 HTTPX 既有语义。
 - `vX.Y.Z`、`pyproject.toml`、Python `__version__` 与 Go 服务端构建版本必须完全一致。
-- 版本不一致必须拒绝创建会话；发布 Windows amd64、Linux amd64、macOS amd64/arm64 二进制及 SHA-256。
+- 版本不一致必须拒绝创建会话；只发布 Windows amd64 二进制及 SHA-256。
 - 文档、注释与用户可见错误使用中文；代码标识符使用英文。
 
 ---
@@ -128,7 +128,7 @@ permissions:
   contents: read
 ```
 
-工作流在 Ubuntu 上安装 Python 3.10、安装 `build` 与测试依赖、运行 Python 全量测试、执行 `python -m build` 和 `twine check dist/*`，最后使用 `pypa/gh-action-pypi-publish` 的 Trusted Publishing 上传。发布前校验标签去掉 `v` 后与 `pyproject.toml` 的版本相同。PyPI 成功后以 matrix 交叉编译 Windows amd64、Linux amd64、macOS amd64/arm64，将标签通过 `-ldflags "-X main.serverVersion=X.Y.Z"` 注入二进制，生成 SHA-256 文件并创建 GitHub Release。
+工作流在 Ubuntu 上安装 Python 3.10、安装 `build` 与测试依赖、运行 Python 全量测试、执行 `python -m build` 和 `twine check dist/*`，最后使用 `pypa/gh-action-pypi-publish` 的 Trusted Publishing 上传。发布前校验标签去掉 `v` 后与 `pyproject.toml` 的版本相同。PyPI 成功后在 Windows runner 构建 Windows amd64 二进制，将标签通过 `-ldflags "-X main.serverVersion=X.Y.Z"` 注入二进制，生成 SHA-256 文件并创建 GitHub Release。
 
 - [ ] **Step 3: 更新 README 与变更记录**
 

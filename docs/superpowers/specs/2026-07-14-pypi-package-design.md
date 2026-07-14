@@ -25,9 +25,9 @@
 
 ## 服务端发布与版本绑定
 
-- 同一个 `vX.Y.Z` 标签构建 PyPI `gohttpx==X.Y.Z`，并构建 Windows amd64、Linux amd64、macOS amd64/arm64 的 Go 服务端二进制。
+- 同一个 `vX.Y.Z` 标签构建 PyPI `gohttpx==X.Y.Z`，并构建 Windows amd64 的 Go 服务端二进制。
 - Python 创建 Go 会话时携带自己的包版本；Go 服务端要求其与自身构建版本完全相等。版本不一致时拒绝会话并给出升级对应一端的提示。
-- GitHub Release 只在 Python 包发布成功后创建，附件包含四个平台二进制及每个文件的 SHA-256 校验值。
+- GitHub Release 只在 Python 包发布成功后创建，附件包含 Windows amd64 二进制及其 SHA-256 校验值。
 - Go 服务端版本由构建标签通过 linker flag 注入；本地开发与测试默认仍为 `1.0.0`。
 
 ## 非目标
