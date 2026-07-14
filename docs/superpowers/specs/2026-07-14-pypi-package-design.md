@@ -19,9 +19,16 @@
 
 ## 发布与验证
 
-- GitHub Actions 在推送 `v*` 标签时构建 sdist/wheel、在干净环境安装 wheel 并运行 Python 测试，然后以 GitHub Secret 中的 PyPI token 发布。
+- GitHub Actions 在推送 `v*` 标签时构建 sdist/wheel、在干净环境安装 wheel 并运行 Python 测试，然后以 PyPI Trusted Publishing 发布。
 - 本地测试覆盖：从 wheel 安装后可导入、原有客户端 API 可用、bridge 不可达时异常包含项目地址。
 - 发布版本由 Git 标签与 `pyproject.toml` 版本一致性校验保证；首个版本使用当前协议版本 `1.0.0`。
+
+## 服务端发布与版本绑定
+
+- 同一个 `vX.Y.Z` 标签构建 PyPI `gohttpx==X.Y.Z`，并构建 Windows amd64、Linux amd64、macOS amd64/arm64 的 Go 服务端二进制。
+- Python 创建 Go 会话时携带自己的包版本；Go 服务端要求其与自身构建版本完全相等。版本不一致时拒绝会话并给出升级对应一端的提示。
+- GitHub Release 只在 Python 包发布成功后创建，附件包含四个平台二进制及每个文件的 SHA-256 校验值。
+- Go 服务端版本由构建标签通过 linker flag 注入；本地开发与测试默认仍为 `1.0.0`。
 
 ## 非目标
 
