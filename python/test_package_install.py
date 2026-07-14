@@ -8,27 +8,31 @@ from pathlib import Path
 class PackageInstallTests(unittest.TestCase):
     def test_installed_package_exports_client(self):
         root = Path(__file__).parent.parent
-        wheel = root / "dist" / "gohttpx-1.0.0-py3-none-any.whl"
+        wheels = list((root / "dist").glob("gohttpx-*.whl"))
+        self.assertEqual(len(wheels), 1, "expected one built wheel")
+        wheel = wheels[0]
         with tempfile.TemporaryDirectory() as directory:
             environment = Path(directory) / "venv"
             subprocess.run(
-                [sys.executable, "-m", "venv", "--system-site-packages", environment],
+                [sys.executable, "-m", "venv", environment],
                 check=True,
                 text=True,
                 encoding="utf-8",
             )
             interpreter = environment / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
             subprocess.run(
-                [interpreter, "-m", "pip", "install", "--no-deps", wheel],
+                [interpreter, "-m", "pip", "install", wheel],
                 check=True,
                 text=True,
                 encoding="utf-8",
+                cwd=directory,
             )
             subprocess.run(
                 [interpreter, "-c", "from gohttpx import AsyncClient, Client, RequestOptions"],
                 check=True,
                 text=True,
                 encoding="utf-8",
+                cwd=directory,
             )
 
 
