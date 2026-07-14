@@ -22,10 +22,12 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           package_version="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")"
+          module_version="$(python -c 'import ast; from pathlib import Path; print(next(node.value.value for node in ast.parse(Path("python/gohttpx.py").read_text(encoding="utf-8")).body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)))')"
           test "$version" = "$package_version"
+          test "$version" = "$module_version"
           echo "value=$version" >> "$GITHUB_OUTPUT"
-      - run: python -B -m unittest discover -s python -p "test_*.py" -v
       - run: python -m build
+      - run: python -B -m unittest discover -s python -p "test_*.py" -v
       - run: python -m twine check dist/*
       - uses: actions/upload-artifact@v4
         with:
