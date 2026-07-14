@@ -108,6 +108,17 @@ func TestVersionFlagNeedsNoTokenAndReportsFixedBuildVersions(t *testing.T) {
 	}
 }
 
+func TestCLIHelpDescribesBidirectionalBodyLimit(t *testing.T) {
+	command := exec.Command("go", "run", ".", "--help")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--help failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "最大目标请求与响应正文（MiB）") {
+		t.Fatalf("--help output = %q", output)
+	}
+}
+
 func TestCLIFlagTokenOverridesEnvironment(t *testing.T) {
 	options, err := parseCLI([]string{"--token", "flag-secret"}, "env-secret")
 	if err != nil {

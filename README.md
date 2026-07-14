@@ -6,7 +6,7 @@ GoHTTPX 在本机常驻一个 Go 发包服务，让 Python 继续使用 HTTPX 0.
 
 ## 架构与状态边界
 
-一个由运维人员手动启动的 loopback Go 服务，可以由同一 Python 后端中的多个站点模块共享。每个 Python `Client` 或 `AsyncClient` 对应一个独立的 Go `req.Client` 会话，因此 TLS、代理、HTTP 版本、连接池和重试配置互不串用。
+一个由运维人员手动启动的 loopback Go 服务，可以由同一 Python 后端中的多个站点模块共享。同步 `Client` 在构造时立即创建 Go `req.Client` 会话；异步 `AsyncClient` 在第一次请求时懒创建。每个已经创建会话的 client 都对应一个独立 Go session，因此 TLS、代理、HTTP 版本、连接池和重试配置互不串用。
 
 HTTPX 负责 params、headers、cookies、Basic/Digest auth、redirect、`json/data/files/content` 编码以及最终 `Response`；Go 会话只保存底层网络配置。业务 cookies、headers 和 auth 不会在 Go 中持久化，控制 API 的 bearer token 也不会转发给目标站点。Python 不会启动或停止 Go 服务。
 
@@ -55,7 +55,7 @@ Invoke-RestMethod http://127.0.0.1:9876/api/v1/health
 Invoke-RestMethod http://127.0.0.1:9876/api/v1/capabilities -Headers @{Authorization="Bearer $env:GOHTTPX_TOKEN"}
 ```
 
-`health` 无需鉴权，固定返回 `status`、`protocol_version`、`server_version`。`capabilities` 需要 bearer，v1 精确返回四个字段：`protocol_version`、`server_version`、`max_body_bytes`、`tls_fingerprints`。
+`health` 无需鉴权，固定返回 `status`、`protocol_version`、`server_version`。正常模式下 `capabilities` 需要 bearer；只有显式使用 `--insecure-no-auth` 的本机调试模式才免鉴权。v1 capabilities 精确返回四个字段：`protocol_version`、`server_version`、`max_body_bytes`、`tls_fingerprints`。
 
 ## Python 单文件接入
 
@@ -309,7 +309,7 @@ with Client(go_token="secret") as client:
     dump = response.extensions.get("go_dump")
 ```
 
-`go_trace` 在启用时包含且仅包含：`dns_lookup_ms`、`connect_ms`、`tls_handshake_ms`、`first_byte_ms`、`response_ms`、`total_ms`、`connection_reused`、`remote_address`。`go_dump` 只在启用 dump 时存在，可能含目标 headers 和 body，调用方必须按敏感诊断数据保护；服务普通日志不会记录这些内容。
+`go_trace` 在启用时包含且仅包含：`dns_lookup_ms`、`connect_ms`、`tls_handshake_ms`、`first_byte_ms`、`response_ms`、`total_ms`、`connection_reused`、`remote_address`。`go_dump` 只在启用 dump 时存在，可能含目标 headers 和 body，调用方必须按敏感诊断数据保护；Go 服务不记录请求日志。
 
 ## 错误映射与会话重建
 
@@ -343,15 +343,15 @@ with Client(go_token="secret") as client:
 - Go 不持久化业务 cookies/headers/auth，不跟随 redirect，不使用 CookieJar，不自动字符集转换。
 - `Host`、`Content-Length`、连接复用和 HTTP/2 帧仍受 req 与 Go Transport 控制；本项目不承诺任意原始 TCP 报文重放。
 - 鉴权仅面向本机 loopback bearer；控制 token 不进入目标请求。
-- 普通服务日志仅记录 request ID、method、目标 host、status、耗时和错误码，不记录 query、token、Authorization、Proxy-Authorization、Cookie、headers 或 body。
+- Go 服务不输出启动日志或请求日志。控制面错误直接返回 JSON error envelope，Python 映射为带原始 request 的 HTTPX/`GoProtocolError` 异常，页面层可直接捕获并展示。
 
 ## 运维与升级
 
 Go 服务应由进程管理器或运维脚本手动常驻启动；Python 进程只连接它。按 Ctrl+C 会触发最多 10 秒的 graceful shutdown，并关闭已登记会话的空闲连接。孤儿会话默认空闲 24 小时后回收；正在执行的会话不会被空闲清理。
 
-两个 Python Client 始终对应两个 Go session。关闭一个 Client 会幂等删除它自己的 session，不影响另一个 Client。服务重启导致 session 丢失时，下一次请求按上述 `CLIENT_NOT_FOUND` 规则重建。
+两个同步 Client 构造完成后立即对应两个独立 Go session；两个异步 AsyncClient 则在各自第一次请求后才分别拥有独立 session。关闭一个已创建会话的 client 会幂等删除它自己的 session，不影响另一个 client。服务重启导致 session 丢失时，下一次请求按上述 `CLIENT_NOT_FOUND` 规则重建。
 
-v1 发布后保持 `/api/v1` 现有字段名、默认值和语义兼容。兼容能力只能增加可选字段、枚举值或新路由；破坏性变更进入 `/api/v2`。Python 包版本与 protocol 版本独立，当前 server/Python 版本均为 `1.0.0`。
+v1 发布后，`/api/v1` 的 exact request/response/error envelopes 不得增加或删除字段，不得改名、改类型、改变默认值或语义。任何协议扩展必须使用新的 `protocol_version` 与 endpoint，或同步升级 Go 服务和 Python SDK 后再发布，不能让单边先接受新字段。Python 包版本与 protocol 版本独立，当前 server/Python 版本均为 `1.0.0`。
 
 ## 测试与离线 E2E
 

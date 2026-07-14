@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net"
 	"net/http"
@@ -566,17 +565,7 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: apiError{Code: "INTERNAL_ERROR", Message: "failed to create request ID"}})
 		return
 	}
-	started := time.Now()
-	method := ""
-	host := ""
-	status := 0
-	errorCode := ""
-	defer func() {
-		log.Printf("request_id=%q method=%q host=%q status=%d elapsed_ms=%.3f error_code=%q", requestID, method, host, status, float64(time.Since(started))/float64(time.Millisecond), errorCode)
-	}()
 	writeError := func(httpStatus int, code, message string, retryable bool) {
-		status = httpStatus
-		errorCode = code
 		writeJSON(w, httpStatus, errorResponse{Error: apiError{Code: code, Message: message, Retryable: retryable, RequestID: requestID}})
 	}
 
@@ -600,10 +589,6 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	input, headers, body, validationError := decodeRequestEnvelope(w, r, s.maxBodyBytes)
-	method = input.Method
-	if parsedURL, parseErr := url.Parse(input.URL); parseErr == nil {
-		host = parsedURL.Host
-	}
 	if validationError != nil {
 		writeError(http.StatusBadRequest, validationError.Code, validationError.Message, false)
 		return
@@ -763,7 +748,6 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 			RemoteAddress:    remoteAddress,
 		}
 	}
-	status = response.StatusCode
 	var responseDump *string
 	if input.Options.Dump {
 		value := dump.String()
@@ -1529,7 +1513,5 @@ func (s *server) cleanupIdleClients(now time.Time) {
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
-		log.Printf("JSON 响应编码失败: %v", err)
-	}
+	_ = json.NewEncoder(w).Encode(value)
 }
