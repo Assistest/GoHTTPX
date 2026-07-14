@@ -2,9 +2,6 @@ import asyncio
 import base64
 import json
 import os
-import socket
-import subprocess
-import tempfile
 import threading
 import time
 import unittest
@@ -33,6 +30,7 @@ from gohttpx import (
     TLSFingerprint,
     TransportOptions,
 )
+from e2e_support import GoHTTPXService
 
 
 FINGERPRINTS = [
@@ -1642,27 +1640,21 @@ class LoopbackTargetHandler(BaseHTTPRequestHandler):
 class GoHTTPXE2ETests(unittest.TestCase):
     token = "e2e-fixed-token"
 
+    def test_real_service_starts_and_removes_its_temp_exe(self):
+        service = GoHTTPXService(module_dir=Path(__file__).resolve().parents[1])
+        service.start()
+        self.assertEqual(httpx.get(service.endpoint + "/api/v1/health", trust_env=False).status_code, 200)
+        exe_path = service.exe_path
+        service.close()
+        self.assertFalse(exe_path.exists())
+
     @classmethod
     def setUpClass(cls):
-        cls.exe_path = Path(tempfile.gettempdir()) / f"gohttpx-test-{os.getpid()}.exe"
+        cls.service = GoHTTPXService(module_dir=Path(__file__).resolve().parents[1])
+        cls.exe_path = cls.service.exe_path
         cls.go_process = None
         cls.target_server = None
         cls.target_thread = None
-        if cls.exe_path.exists():
-            raise RuntimeError(f"临时 EXE 已存在，拒绝覆盖: {cls.exe_path}")
-        module_dir = Path(__file__).resolve().parents[1]
-        built = subprocess.run(
-            ["go", "build", "-o", str(cls.exe_path), "."],
-            cwd=module_dir,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-        )
-        if built.returncode:
-            if cls.exe_path.exists():
-                cls.exe_path.unlink()
-            raise RuntimeError(f"go build 失败 ({built.returncode}):\n{built.stdout}{built.stderr}")
         try:
             cls.target_state = LoopbackTarget()
             cls.target_server = ThreadingHTTPServer(("127.0.0.1", 0), LoopbackTargetHandler)
@@ -1672,29 +1664,9 @@ class GoHTTPXE2ETests(unittest.TestCase):
             host, port = cls.target_server.server_address
             cls.target_endpoint = f"http://{host}:{port}"
 
-            with socket.socket() as probe:
-                probe.bind(("127.0.0.1", 0))
-                go_port = probe.getsockname()[1]
-            cls.go_endpoint = f"http://127.0.0.1:{go_port}"
-            cls.go_process = subprocess.Popen(
-                [str(cls.exe_path), "--host", "127.0.0.1", "--port", str(go_port), "--token", cls.token],
-                cwd=module_dir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                if cls.go_process.poll() is not None:
-                    raise RuntimeError(f"Go 服务提前退出，exit code={cls.go_process.returncode}")
-                try:
-                    response = httpx.get(cls.go_endpoint + "/api/v1/health", timeout=0.2, trust_env=False)
-                    if response.status_code == 200:
-                        break
-                except httpx.TransportError:
-                    pass
-                time.sleep(0.05)
-            else:
-                raise RuntimeError(f"Go 服务 health 超时，exit code={cls.go_process.poll()}")
+            cls.service.start()
+            cls.go_endpoint = cls.service.endpoint
+            cls.go_process = cls.service.process
         except BaseException:
             cls.tearDownClass()
             raise
@@ -1706,17 +1678,7 @@ class GoHTTPXE2ETests(unittest.TestCase):
             cls.target_server.server_close()
         if cls.target_thread is not None:
             cls.target_thread.join(5)
-        if cls.go_process is not None and cls.go_process.poll() is None:
-            cls.go_process.terminate()
-            try:
-                cls.go_process.wait(5)
-            except subprocess.TimeoutExpired:
-                cls.go_process.kill()
-                cls.go_process.wait(5)
-        if cls.exe_path.exists():
-            cls.exe_path.unlink()
-        if cls.exe_path.exists():
-            raise AssertionError(f"临时 EXE 清理失败: {cls.exe_path}")
+        cls.service.close()
 
     def setUp(self):
         with self.target_state.lock:
