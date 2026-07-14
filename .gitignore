@@ -5,3 +5,4 @@ __pycache__/
 /gohttpx-server.exe
 /gohttpx-server.exe~
 .superpowers/
+.worktrees/
