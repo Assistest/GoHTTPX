@@ -536,7 +536,7 @@ func (s *server) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 	if input.Impersonate == "" {
 		input.Impersonate = "none"
 	}
-	if input.TLSFingerprint == "" && input.Impersonate == "none" {
+	if input.TLSFingerprint == "" && input.Impersonate == "none" && input.HTTPVersion != "http2" {
 		input.TLSFingerprint = "android_11_okhttp"
 	}
 	client, err := buildReqClient(input)
@@ -1019,12 +1019,14 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 			client.ImpersonateSafari()
 			clientHelloID = utls.HelloSafari_Auto
 		default:
-			fingerprint := input.TLSFingerprint
-			if fingerprint == "" {
-				fingerprint = "android_11_okhttp"
+			if input.HTTPVersion != "http2" {
+				fingerprint := input.TLSFingerprint
+				if fingerprint == "" {
+					fingerprint = "android_11_okhttp"
+				}
+				clientHelloID = fingerprints[fingerprint]
+				client.SetTLSFingerprint(clientHelloID)
 			}
-			clientHelloID = fingerprints[fingerprint]
-			client.SetTLSFingerprint(clientHelloID)
 		}
 		if input.ClientCertPEM != "" {
 			setClientCertificateTLSHandshake(client, clientHelloID)
@@ -1297,6 +1299,9 @@ func validateClientConfig(input createClientRequest) error {
 	}
 	if httpVersion != "auto" && httpVersion != "http1" && httpVersion != "http2" && httpVersion != "http3" && httpVersion != "h2c" {
 		return fmt.Errorf("invalid HTTP version %q", input.HTTPVersion)
+	}
+	if httpVersion == "http2" && (input.tlsFingerprintSet || input.TLSFingerprint != "" || input.Impersonate != "" && input.Impersonate != "none") {
+		return errors.New("HTTP/2 cannot be combined with TLS fingerprint or browser impersonate")
 	}
 	if input.ProxyURL != "" && (httpVersion == "http2" || httpVersion == "http3" || httpVersion == "h2c") {
 		return errors.New("proxy_url cannot be combined with forced HTTP/2, HTTP/3, or H2C")

@@ -339,7 +339,7 @@ def _client_payload(options: ClientOptions) -> dict[str, Any]:
         for name in ("expect_continue_timeout_ms", "max_idle_conns"):
             if getattr(options.transport, name) == getattr(defaults, name):
                 payload["transport"][name] = 0
-    if "tls_fingerprint" not in payload and impersonate == "none" and payload.get("http_version") != "http3":
+    if "tls_fingerprint" not in payload and impersonate == "none" and payload.get("http_version") not in ("http2", "http3"):
         payload["tls_fingerprint"] = TLSFingerprint.ANDROID_11_OKHTTP.value
     return payload
 

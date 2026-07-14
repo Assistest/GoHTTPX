@@ -1,4 +1,5 @@
 import base64
+import ipaddress
 import json
 import os
 import socket
@@ -6,11 +7,16 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import httpx
 
 
@@ -209,3 +215,128 @@ class GoHTTPXService:
             self.exe_path.unlink()
         if self.exe_path.exists():
             raise AssertionError(f"临时 EXE 清理失败: {self.exe_path}")
+
+
+class TransportTarget:
+    def __init__(self, module_dir):
+        self.module_dir = Path(module_dir)
+        self.target_dir = (self.module_dir / "testdata" / "e2e-target").resolve()
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="gohttpx-transport-")
+        self.temp_path = Path(self.temp_dir.name).resolve()
+        handle, name = tempfile.mkstemp(prefix="gohttpx-target-", suffix=".exe")
+        self.exe_path = Path(name).resolve()
+        os.close(handle)
+        self.exe_path.unlink()
+        self.process = None
+        self.ca_path = self.temp_path / "ca.pem"
+        self.server_cert_path = self.temp_path / "server.pem"
+        self.server_key_path = self.temp_path / "server-key.pem"
+        self.client_cert_path = self.temp_path / "client.pem"
+        self.client_key_path = self.temp_path / "client-key.pem"
+        self.log_path = self.temp_path / "target.log"
+        self.log_file = None
+        self._write_certificates()
+        self.http_endpoint = ""
+        self.https_endpoint = ""
+        self.h2c_endpoint = ""
+        self.http3_endpoint = ""
+        self.mtls_endpoint = ""
+
+    def _write_certificates(self):
+        now = datetime.now(timezone.utc)
+        ca_key = ec.generate_private_key(ec.SECP256R1())
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "GoHTTPX E2E CA")])
+        ca_cert = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(1)
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(ca_key, hashes.SHA256())
+        )
+        self.ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+        self._write_leaf(ca_cert, ca_key, self.server_cert_path, self.server_key_path, 2, False)
+        self._write_leaf(ca_cert, ca_key, self.client_cert_path, self.client_key_path, 3, True)
+
+    def _write_leaf(self, ca_cert, ca_key, cert_path, key_path, serial, client):
+        key = ec.generate_private_key(ec.SECP256R1())
+        usage = ExtendedKeyUsageOID.CLIENT_AUTH if client else ExtendedKeyUsageOID.SERVER_AUTH
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "GoHTTPX E2E client" if client else "127.0.0.1")]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(serial)
+            .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=1))
+            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([usage]), critical=False)
+        )
+        if not client:
+            builder = builder.add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        cert_path.write_bytes(builder.sign(ca_key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM))
+        key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+
+    def start(self):
+        built = subprocess.run(
+            ["go", "build", "-o", str(self.exe_path), "."],
+            cwd=self.target_dir,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+        )
+        if built.returncode:
+            self.close()
+            raise RuntimeError(f"测试靶场构建失败 ({built.returncode}):\n{built.stdout}{built.stderr}")
+        ports = [reserve_loopback_port() for _ in range(5)]
+        self.http_endpoint = f"http://127.0.0.1:{ports[0]}"
+        self.https_endpoint = f"https://127.0.0.1:{ports[1]}"
+        self.h2c_endpoint = f"http://127.0.0.1:{ports[2]}"
+        self.http3_endpoint = f"https://127.0.0.1:{ports[3]}"
+        self.mtls_endpoint = f"https://127.0.0.1:{ports[4]}"
+        args = [
+            str(self.exe_path),
+            "--http-port", str(ports[0]),
+            "--https-port", str(ports[1]),
+            "--h2c-port", str(ports[2]),
+            "--http3-port", str(ports[3]),
+            "--mtls-port", str(ports[4]),
+            "--server-cert", str(self.server_cert_path),
+            "--server-key", str(self.server_key_path),
+            "--ca-cert", str(self.ca_path),
+        ]
+        try:
+            self.log_file = self.log_path.open("wb")
+            self.process = subprocess.Popen(args, cwd=self.target_dir, stdout=subprocess.DEVNULL, stderr=self.log_file)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if self.process.poll() is not None:
+                    raise RuntimeError(f"测试靶场提前退出，exit code={self.process.returncode}")
+                try:
+                    with socket.create_connection(("127.0.0.1", ports[1]), timeout=0.2):
+                        return
+                except OSError:
+                    time.sleep(0.05)
+            raise RuntimeError(f"测试靶场启动超时，exit code={self.process.poll()}")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(5)
+        if self.exe_path.exists():
+            self.exe_path.unlink()
+        if self.log_file is not None:
+            self.log_file.close()
+            self.log_file = None
+        self.temp_dir.cleanup()

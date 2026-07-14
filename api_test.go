@@ -1159,6 +1159,30 @@ func TestClientOptionsHTTPVersions(t *testing.T) {
 	}
 }
 
+func TestHTTP2RejectsExplicitFingerprintAndBrowserImpersonation(t *testing.T) {
+	for _, input := range []createClientRequest{
+		{HTTPVersion: "http2", TLSFingerprint: "android_11_okhttp", tlsFingerprintSet: true},
+		{HTTPVersion: "http2", Impersonate: "chrome"},
+	} {
+		if err := validateClientConfig(input); err == nil {
+			t.Fatal("expected HTTP/2 validation error")
+		}
+	}
+	if err := validateClientConfig(createClientRequest{HTTPVersion: "http2", Impersonate: "none"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTP2WithoutFingerprintDecodesAsDefaultTLS(t *testing.T) {
+	var input createClientRequest
+	if err := json.Unmarshal([]byte(`{"protocol_version":1,"http_version":"http2","impersonate":"none"}`), &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.tlsFingerprintSet || input.TLSFingerprint != "" || input.Impersonate != "none" {
+		t.Fatalf("input=%#v", input)
+	}
+}
+
 func TestClientOptionsH2CSendsCleartextHTTP2(t *testing.T) {
 	protocol := make(chan int, 1)
 	target := httptest.NewServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
