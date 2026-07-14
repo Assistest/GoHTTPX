@@ -1781,9 +1781,11 @@ func TestClientOptionsStrictNestedJSONAndInvalidConfigurationCode(t *testing.T) 
 func TestRequestOptionsMapChunkedCloseRetryTraceAndDump(t *testing.T) {
 	var calls int
 	var closed bool
+	var chunked bool
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		closed = r.Close
+		chunked = len(r.TransferEncoding) == 1 && r.TransferEncoding[0] == "chunked"
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("dump body"))
 	}))
@@ -1818,8 +1820,44 @@ func TestRequestOptionsMapChunkedCloseRetryTraceAndDump(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 || !closed || result.Trace == nil || result.Dump == nil || !strings.Contains(*result.Dump, "dump body") {
-		t.Fatalf("calls=%d closed=%t trace=%#v dump=%v", calls, closed, result.Trace, result.Dump)
+	if calls != 1 || !closed || !chunked || result.Trace == nil || result.Dump == nil || !strings.Contains(*result.Dump, "dump body") {
+		t.Fatalf("calls=%d closed=%t chunked=%t trace=%#v dump=%v", calls, closed, chunked, result.Trace, result.Dump)
+	}
+}
+
+func TestForceChunkedBodyRetriesWithFreshReader(t *testing.T) {
+	var bodies [][]byte
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, body)
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	s := newServer("", 48<<20, time.Hour)
+	client, err := buildReqClient(createClientRequest{Retry: retryConfig{Count: 1, Mode: retryFixed, FixedIntervalMS: 1, StatusCodes: []int{http.StatusServiceUnavailable}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientID = "chunked-retry"
+	s.clients[clientID] = &clientSession{client: client, lastUsed: time.Now()}
+	response := sendRawRequest(t, s.routes(), clientID, requestEnvelope{
+		ProtocolVersion: protocolVersion,
+		Method:          http.MethodPost,
+		URL:             target.URL,
+		BodyBase64:      base64.StdEncoding.EncodeToString([]byte("retry body")),
+		Options:         requestOptions{ForceChunked: true},
+	})
+	var result responseEnvelope
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil || result.StatusCode != http.StatusNoContent || !reflect.DeepEqual(bodies, [][]byte{[]byte("retry body"), []byte("retry body")}) {
+		t.Fatalf("status=%d result=%#v bodies=%q", response.Code, result, bodies)
 	}
 }
 

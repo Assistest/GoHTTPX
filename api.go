@@ -659,6 +659,9 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		originalHeaders[name] = append(originalHeaders[name], pair[1])
 	}
+	if input.Options.CloseConnection {
+		originalHeaders.Del("Connection")
+	}
 	headerOrder := automaticOrder
 	if len(input.Options.HeaderOrder) > 0 {
 		headerOrder = input.Options.HeaderOrder
@@ -671,7 +674,11 @@ func (s *server) handleRawRequest(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, requestHeaderStateKey{}, headerState)
 	targetReq.Headers = originalHeaders.Clone()
 	targetReq.SetContext(ctx)
-	if len(body) > 0 {
+	if input.Options.ForceChunked && len(body) > 0 {
+		targetReq.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+	} else if len(body) > 0 {
 		targetReq.SetBodyBytes(body)
 	}
 	var dump bytes.Buffer

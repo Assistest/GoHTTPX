@@ -18,7 +18,7 @@ python -B -m unittest discover -s python -p "test_gohttpx_e2e_httpx.py" -v
 - 夹具实现所需的 `/echo/*`、重定向、cookie、Basic/Digest、状态码、慢响应、二进制、trace/dump 和 retry 路由。
 - `python/test_gohttpx_e2e_httpx.py` 新增六个真实 Go 服务到 loopback target 的同步/异步 E2E 测试，覆盖全部要求的 HTTP 方法、body、响应与异常语义。
 
-未修改 `api.go`、其他 Go 生产代码或 `python/gohttpx.py`。
+初版未修改 `api.go` 或 `python/gohttpx.py`；后续修复仅改动 `api.go` 的请求 body/header 映射。
 
 ## GREEN / 验证
 
@@ -39,7 +39,7 @@ AssertionError: None != 'chunked'
 
 其余通过：方法/body、query/重复 header/cookie/重定向、认证/二进制/非成功状态、超时/GET retry/POST 禁止重放控制、AsyncClient。
 
-## BLOCKED / 顾虑
+## 初版 BLOCKED / 顾虑（已解决）
 
 测试故意保留失败断言，未调整预期，也未修改生产代码。
 
@@ -51,6 +51,39 @@ Go `decodeRequestEnvelope`（`api.go:613`）→ `session.client.R()` / `SetBodyB
 故障点不在 envelope 丢失或 Go 映射未调用；实际 HTTP/1.1 loopback target 收到 Content-Length，未收到
 `Transfer-Encoding: chunked`。依据当前 `github.com/imroc/req/v3 v3.59.0` 的实际行为，
 `EnableForceChunkedEncoding()` 没有令该请求在线路上采用 chunked 编码。需要生产层修复或升级该依赖后，此测试才能转绿。
+
+## 修复后 RED / GREEN
+
+保留上述 Python E2E RED 后，在 `api_test.go` 的
+`TestRequestOptionsMapChunkedCloseRetryTraceAndDump` 增加了目标真实收到 chunked 的断言；修复前它稳定失败：
+
+```text
+calls=1 closed=true chunked=false
+```
+
+修复将 `force_chunked` 且有 body 的请求改为只设置可重建的 `GetBody`：每次调用都返回新的
+`io.NopCloser(bytes.NewReader(body))`，不调用会写入已知长度的 `SetBodyBytes`。这既让 req/v3 使用 chunked 编码，也保证 retry 能重新读取 body。
+此外，`close_connection` 在构造 context 中保存的 header state 前删除输入的 `Connection`，避免 Python HTTPX 的
+`Connection: keep-alive` 被 wrapper 重新写回并覆盖 req 的 close 标志。
+
+验证：
+
+```text
+python -B -m unittest discover -s python -p "test_gohttpx_e2e_httpx.py" -v
+Ran 6 tests ... OK
+
+go test . -run "TestRequestOptionsMapChunkedCloseRetryTraceAndDump|TestForceChunkedBodyRetriesWithFreshReader" -count=1
+ok   gohttpx
+
+go test .
+ok   gohttpx
+```
+
+`TestForceChunkedBodyRetriesWithFreshReader` 断言第一次 503 后第二次请求仍携带完整 `retry body`。
+
+## 当前顾虑
+
+无；`python/gohttpx.py` 未修改，`api.go` 用户已有的空白行未触碰。
 
 ## 自审
 

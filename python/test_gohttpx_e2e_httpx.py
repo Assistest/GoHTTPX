@@ -22,8 +22,10 @@ class HTTPXSemanticE2ETests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.service.close()
-        cls.fixture.close()
+        try:
+            cls.service.close()
+        finally:
+            cls.fixture.close()
 
     def setUp(self):
         with self.fixture.lock:
@@ -91,7 +93,10 @@ class HTTPXSemanticE2ETests(unittest.TestCase):
             calls = list(self.fixture.calls)
         self.assertEqual(calls[0]["headers"][-1][0].lower(), "authorization")
         self.assertEqual([call["path"] for call in calls].count("/auth/digest"), 2)
-        self.assertEqual(calls[-1]["path"], "/status/500")
+        self.assertEqual([call["path"] for call in calls if call["path"] == "/binary"], ["/binary"])
+        self.assertEqual([call["body"] for call in calls if call["path"] == "/binary"], [b""])
+        self.assertEqual([call["path"] for call in calls if call["path"] == "/status/404"], ["/status/404"])
+        self.assertEqual([call["path"] for call in calls if call["path"] == "/status/500"], ["/status/500"])
 
     def test_request_options_trace_dump_chunked_and_close_reach_target(self):
         options = RequestOptions(force_chunked=True, close_connection=True, trace=True, dump=True)
@@ -113,6 +118,8 @@ class HTTPXSemanticE2ETests(unittest.TestCase):
             with self.assertRaises(httpx.TimeoutException) as caught:
                 client.get(self.fixture.endpoint + "/slow?seconds=0.2", timeout=0.02)
         self.assertEqual(caught.exception.code, "UPSTREAM_TIMEOUT")
+        with self.fixture.lock:
+            self.assertEqual([call["path"] for call in self.fixture.calls], ["/slow"])
         with Client(
             go_endpoint=self.service.endpoint,
             go_token=self.service.token,
