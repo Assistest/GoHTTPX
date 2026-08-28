@@ -496,8 +496,8 @@ gohttpx-server.exe --version
 
 ## 18. 当前固定版本
 
-- GoHTTPX server：`2.1.0`
-- Python SDK：`2.1.0`
+- GoHTTPX server：`2.1.1`
+- Python SDK：`2.1.1`
 - protocol：`1`
 - Python：`>=3.10`
 - HTTPX：`>=0.28,<0.29`

@@ -30,6 +30,7 @@ from gohttpx import (
     RetryOptions,
     TLSFingerprint,
     TransportOptions,
+    tls_spec_from_client_hello,
 )
 from e2e_support import GoHTTPXService
 
@@ -85,6 +86,66 @@ FINGERPRINTS = [
     "qq_auto",
     "qq_11_1",
 ]
+
+
+def _tls_vector(data: bytes, width: int) -> bytes:
+    return len(data).to_bytes(width, "big") + data
+
+
+def _tls_extension(kind: int, data: bytes) -> bytes:
+    return kind.to_bytes(2, "big") + len(data).to_bytes(2, "big") + data
+
+
+def _wireshark_dump(data: bytes) -> str:
+    lines = []
+    for offset in range(0, len(data), 16):
+        chunk = " ".join(f"{byte:02x}" for byte in data[offset:offset + 16])
+        lines.append(f"{offset:04x}   {chunk}")
+    return "\n".join(lines)
+
+
+def _sample_client_hello(extra: bytes = b""):
+    ciphers = b"\x0a\x0a\x13\x02\x13\x03\x13\x01"
+    sni = _tls_vector(b"\x00" + _tls_vector(b"localhost", 2), 2)
+    versions = bytes([4]) + b"\x0a\x0a\x03\x04"
+    groups = _tls_vector(b"\x0a\x0a\x00\x17\x00\x1d", 2)
+    shares = _tls_vector(b"\x0a\x0a\x00\x01\x00\x00\x1d\x00\x20" + b"\x00" * 32, 2)
+    alpn = _tls_vector(b"\x08http/1.1", 2)
+    signatures = _tls_vector(b"\x08\x05\x04\x03\x08\x04", 2)
+    extensions = b"".join((
+        _tls_extension(0x0A0A, b"\x00"),
+        _tls_extension(0, sni),
+        _tls_extension(13, signatures),
+        _tls_extension(43, versions),
+        _tls_extension(10, groups),
+        _tls_extension(51, shares),
+        _tls_extension(16, alpn),
+        _tls_extension(27, b"\x02\x00\x02"),
+        extra,
+        _tls_extension(0x1A1A, b""),
+    ))
+    body = b"\x03\x03" + b"\x11" * 32 + b"\x00" + _tls_vector(ciphers, 2) + b"\x01\x00" + _tls_vector(extensions, 2)
+    handshake = b"\x01" + len(body).to_bytes(3, "big") + body
+    record = b"\x16\x03\x01" + len(handshake).to_bytes(2, "big") + handshake
+    expected = {
+        "cipher_suites": ["GREASE", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256", "TLS_AES_128_GCM_SHA256"],
+        "compression_methods": ["NULL"],
+        "extensions": [
+            {"name": "GREASE"},
+            {"name": "server_name"},
+            {"name": "signature_algorithms", "supported_signature_algorithms": ["rsa_pss_rsae_sha384", "ecdsa_secp256r1_sha256", "rsa_pss_rsae_sha256"]},
+            {"name": "supported_versions", "versions": ["GREASE", "TLS 1.3"]},
+            {"name": "supported_groups", "named_group_list": ["GREASE", "secp256r1", "x25519"]},
+            {"name": "key_share", "client_shares": [{"group": "GREASE"}, {"group": "x25519"}]},
+            {"name": "application_layer_protocol_negotiation", "protocol_name_list": ["http/1.1"]},
+            {"name": "compress_certificate", "algorithms": ["brotli"]},
+            {"name": "GREASE"},
+        ],
+        "shuffle_extensions": False,
+        "min_vers": 772,
+        "max_vers": 772,
+    }
+    return record, expected
 
 
 class FakeGo:
@@ -169,7 +230,7 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             200,
             {
                 "protocol_version": 1,
-                "server_version": "2.1.0",
+                "server_version": "2.1.1",
                 "max_body_bytes": 48 << 20,
                 "tls_fingerprints": FINGERPRINTS,
             },
@@ -338,7 +399,7 @@ class ClientTests(unittest.TestCase):
         self.thread.join()
 
     def test_enum_matches_go_capabilities_and_default_create_contract(self):
-        self.assertEqual(__version__, "2.1.0")
+        self.assertEqual(__version__, "2.1.1")
         self.assertEqual({item.value for item in TLSFingerprint}, set(FINGERPRINTS))
         self.assertEqual(len(TLSFingerprint), 49)
         client = Client(go_endpoint=self.endpoint, go_token="secret")
@@ -472,6 +533,34 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Client(go_endpoint=self.endpoint, tls_spec=valid, **extra)
         self.assertEqual(self.state.calls, [])
+
+    def test_tls_spec_from_wireshark_hex_and_bytes_omits_sni_and_dynamic_fields(self):
+        record, expected = _sample_client_hello()
+        dump = _wireshark_dump(record)
+        from_bytes = tls_spec_from_client_hello(record)
+        from_text = tls_spec_from_client_hello(dump)
+        from_hex = tls_spec_from_client_hello(record.hex())
+        self.assertEqual(from_bytes, expected)
+        self.assertEqual(from_text, expected)
+        self.assertEqual(from_hex, expected)
+        self.assertNotIn("localhost", json.dumps(from_bytes))
+        padded, _ = _sample_client_hello(_tls_extension(21, b"\x00" * 8))
+        with self.assertRaises(ValueError):
+            tls_spec_from_client_hello(padded)
+        path = Path(__file__).resolve().parents[1] / ".tmp" / "wireshark_hello.txt"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(dump, encoding="utf-8")
+        try:
+            self.assertEqual(tls_spec_from_client_hello(path), expected)
+            with Client(go_endpoint=self.endpoint, tls_spec=dump):
+                pass
+            with Client(go_endpoint=self.endpoint, tls_spec=path):
+                pass
+        finally:
+            path.unlink()
+        creates = [call["payload"] for call in self.state.calls if call["path"] == "/api/v1/clients"]
+        self.assertEqual(creates[-1]["tls_spec"], expected)
+        self.assertNotIn("tls_fingerprint", creates[-1])
 
     def test_http3_default_omits_fingerprint_and_unsupported_transport_defaults(self):
         self.state.enforce_http3_create = True
@@ -758,7 +847,7 @@ class ClientTests(unittest.TestCase):
     def test_capabilities_require_exact_valid_compatible_fields(self):
         valid = {
             "protocol_version": 1,
-            "server_version": "2.1.0",
+            "server_version": "2.1.1",
             "max_body_bytes": 48 << 20,
             "tls_fingerprints": FINGERPRINTS,
         }

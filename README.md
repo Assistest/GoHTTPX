@@ -4,7 +4,7 @@ GoHTTPX 保留 HTTPX 的请求编码、Cookie、认证、重定向和 Response �
 
 **2.0 默认自动托管 Go：每个 Python 进程一份 Go，多个 client 共用进程，但各自拥有独立 session 和 Cookie。** 不需要手动启动服务，不需要配置端口或请求密钥。
 
-当前源码版本为 `2.1.0`，新增自定义 TLS JSON；控制协议仍为 `/api/v1`、`protocol_version=1`，Python 和 Go 必须同版本。公开发布产物见 [PyPI](https://pypi.org/project/gohttpx/) 和 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases)；开发者也可使用下方本地 wheel。
+当前源码版本为 `2.1.1`，支持自定义 TLS JSON，以及从 Wireshark/hex/ClientHello 导入；控制协议仍为 `/api/v1`、`protocol_version=1`，Python 和 Go 必须同版本。公开发布产物见 [PyPI](https://pypi.org/project/gohttpx/) 和 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases)；开发者也可使用下方本地 wheel。
 
 ## 免责声明
 
@@ -23,7 +23,7 @@ GoHTTPX 是 HTTP 客户端，**只用于你有权访问的接口测试、自动�
 从 PyPI 安装，Go EXE 随 wheel 一起安装，无需另行下载：
 
 ```powershell
-python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.0"
+python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.1"
 ```
 
 `--only-binary=gohttpx` 避免在不支持的平台意外回退到源码编译；本版本不提供 Linux/macOS 托管安装包。
@@ -33,7 +33,7 @@ python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.0"
 ```powershell
 python -m pip install build
 python -m build
-python -m pip install --upgrade dist\gohttpx-2.1.0-py3-none-win_amd64.whl
+python -m pip install --upgrade dist\gohttpx-2.1.1-py3-none-win_amd64.whl
 ```
 
 wheel 内置匹配版本的 Go EXE。部署机器安装 wheel 后不需要 Go 编译器；第一次请求不下载、不编译任何程序。2.0 不再支持只复制一个 `gohttpx.py` 即完成接入。
@@ -190,7 +190,7 @@ for client in (http1, http2, http3, h2c):
 
 ### 自定义 TLS JSON（2.1.0 起）
 
-**整段复制即可运行，不需要下载 JSON 文件，也不要求在仓库目录运行。** 先安装 2.1.0 的完整 wheel。
+**整段复制即可运行，不需要下载 JSON 文件，也不要求在仓库目录运行。** 先安装 2.1.1 的完整 wheel。
 
 此示例把当前开放的 **6 个 TLS 顶层字段全部写出**，以此前的 Edge 151 模板为基础，展开扩展参数。它是一组可运行的配置，不是“已实现浏览器全部功能”的承诺。旧、新 ALPS 互斥，替换方式见代码后。
 
@@ -318,6 +318,21 @@ with Client(tls_spec=TLS_SPEC, headers=HEADERS, timeout=20) as client:
 
 `tls_spec` 只支持 `http_version="auto"` 或兼容 ALPN 的 `http1`。需要 HTTP/2 时在 JSON 的 ALPN 中声明 `h2`，保留默认 `auto`，不要强制 `http2`。HTTP/3、H2C、未知扩展、无效字段、重复 JSON key、静态 KeyShare 和不兼容组合明确拒绝；没有失败后退回 Go 默认指纹的路径。
 
+#### 从 Wireshark / hex 导入
+
+`tls_spec` 除了 JSON，也接受 Wireshark「包字节」hex dump、连续十六进制、原始 ClientHello 字节，或指向这些内容的文件路径。Python 会解析握手结构并生成 JSON；**不会**重放抓包里的 random、session ID、KeyShare 公钥或 SNI。SNI 仍来自请求 URL。GREASE 编号归一化成 `GREASE`。未知扩展、h3 ALPN、真实 ECH 参数等当前接口表达不了的字段会直接报错。
+
+```python
+from pathlib import Path
+from gohttpx import Client, tls_spec_from_client_hello
+
+tls_spec = tls_spec_from_client_hello(Path(r"C:\capture\clienthello.txt"))
+with Client(tls_spec=tls_spec) as client:
+    response = client.get("https://example.com/")
+
+# 等价：Client(tls_spec=dump_text) 或 Client(tls_spec=Path(r"C:\capture\clienthello.txt"))
+```
+
 ### TLSFingerprint 全部 49 个值
 
 | 家族 | 值 |
@@ -340,7 +355,7 @@ with Client(tls_spec=TLS_SPEC, headers=HEADERS, timeout=20) as client:
 
 ### ClientOptions
 
-新增 `tls_spec: Mapping[str, Any] | str | None = None`：自定义 TLS JSON；与显式预设和 impersonate 互斥，详见上节。
+新增 `tls_spec: Mapping[str, Any] | str | bytes | Path | None = None`：自定义 TLS JSON，或 Wireshark/hex/ClientHello；与显式预设和 impersonate 互斥，详见上节。
 
 | 字段 | Python 类型 | 默认 | 含义、边界与 HTTP/3 规则 |
 |---|---|---:|---|

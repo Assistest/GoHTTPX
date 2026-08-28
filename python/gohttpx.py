@@ -19,7 +19,7 @@ import httpx
 
 from _gohttpx_runtime import INSTANCE_HEADER, ManagedRuntime, RuntimeConfigurationError, RuntimeUnavailable
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 _runtime = ManagedRuntime(__version__)
 _runtime_lock = threading.RLock()
 
@@ -195,7 +195,7 @@ class ClientOptions:
     retry: RetryOptions = field(default_factory=RetryOptions)
     transport: TransportOptions = field(default_factory=TransportOptions)
     http2: HTTP2Options = field(default_factory=HTTP2Options)
-    tls_spec: Mapping[str, Any] | str | None = None
+    tls_spec: Mapping[str, Any] | str | bytes | os.PathLike[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -390,7 +390,262 @@ def _retarget_transport_error(error: BaseException, request: httpx.Request) -> B
     return error
 
 
-def _normalize_tls_spec(value: Mapping[str, Any] | str) -> str:
+_TLS_CIPHERS = {
+    0x1301: "TLS_AES_128_GCM_SHA256", 0x1302: "TLS_AES_256_GCM_SHA384", 0x1303: "TLS_CHACHA20_POLY1305_SHA256",
+    0xC02B: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", 0xC02F: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    0xC02C: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", 0xC030: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    0xCCA9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", 0xCCA8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    0xC013: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", 0xC014: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    0x009C: "TLS_RSA_WITH_AES_128_GCM_SHA256", 0x009D: "TLS_RSA_WITH_AES_256_GCM_SHA384",
+    0x002F: "TLS_RSA_WITH_AES_128_CBC_SHA", 0x0035: "TLS_RSA_WITH_AES_256_CBC_SHA",
+}
+_TLS_GROUPS = {0x001D: "x25519", 0x0017: "secp256r1", 0x0018: "secp384r1", 0x0019: "secp521r1", 0x11EC: "X25519MLKEM768"}
+_TLS_SIGNATURES = {
+    0x0403: "ecdsa_secp256r1_sha256", 0x0503: "ecdsa_secp384r1_sha384",
+    0x0804: "rsa_pss_rsae_sha256", 0x0805: "rsa_pss_rsae_sha384", 0x0806: "rsa_pss_rsae_sha512",
+    0x0401: "rsa_pkcs1_sha256", 0x0501: "rsa_pkcs1_sha384", 0x0601: "rsa_pkcs1_sha512",
+}
+_TLS_VERSIONS = {0x0303: "TLS 1.2", 0x0304: "TLS 1.3"}
+_TLS_CERT_COMPRESSION = {1: "zlib", 2: "brotli"}
+
+
+def _is_grease_id(value: int) -> bool:
+    return value & 0x0F0F == 0x0A0A and value >> 8 == value & 255
+
+
+def _tls_name(value: int, names: Mapping[int, str]) -> str:
+    if _is_grease_id(value):
+        return "GREASE"
+    return names.get(value, f"0x{value:04x}")
+
+
+def _is_hello_file(value: str) -> bool:
+    if value.lstrip().startswith("{") or "\n" in value or len(value) >= 4096:
+        return False
+    try:
+        return Path(value).is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _parse_hello_hex_text(text: str) -> bytes:
+    dump = bytearray()
+    dump_lines = 0
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r"[0-9A-Fa-f]{3,8}", parts[0]):
+            collected = []
+            for token in parts[1:]:
+                if re.fullmatch(r"[0-9A-Fa-f]{2}", token):
+                    collected.append(int(token, 16))
+                    continue
+                break
+            if collected:
+                dump.extend(collected)
+                dump_lines += 1
+    if dump_lines:
+        return bytes(dump)
+    compact = re.sub(r"(?i)0x", "", text)
+    compact = re.sub(r"[^0-9A-Fa-f]", "", compact)
+    if len(compact) < 12 or len(compact) % 2:
+        raise ValueError("无法从文本中解析 ClientHello 十六进制")
+    return bytes.fromhex(compact)
+
+
+def _unwrap_client_hello(payload: bytes) -> bytes:
+    if len(payload) < 6 or len(payload) > 65536:
+        raise ValueError("ClientHello 长度不合法")
+    if payload[0] == 0x16:
+        handshake = bytearray()
+        offset = 0
+        while offset + 5 <= len(payload) and payload[offset] == 0x16:
+            size = int.from_bytes(payload[offset + 3:offset + 5], "big")
+            chunk = payload[offset + 5:offset + 5 + size]
+            if size > 18432 or len(chunk) != size:
+                raise ValueError("TLS record 长度不完整")
+            handshake.extend(chunk)
+            offset += 5 + size
+        if offset != len(payload):
+            raise ValueError("TLS record 后存在多余字节")
+        payload = bytes(handshake)
+    if payload[:1] != b"\x01" or int.from_bytes(payload[1:4], "big") != len(payload) - 4:
+        raise ValueError("不是完整的 ClientHello handshake")
+    return payload
+
+
+def _take_vector(data: bytes, offset: int, width: int) -> tuple[bytes, int]:
+    if offset + width > len(data):
+        raise ValueError("ClientHello 字段被截断")
+    size = int.from_bytes(data[offset:offset + width], "big")
+    start = offset + width
+    end = start + size
+    if end > len(data):
+        raise ValueError("ClientHello 字段被截断")
+    return data[start:end], end
+
+
+def _uint16_list(data: bytes, prefix: int) -> list[int]:
+    body, offset = _take_vector(data, 0, prefix)
+    if offset != len(data) or len(body) % 2:
+        raise ValueError("TLS 扩展列表长度无效")
+    return [int.from_bytes(body[i:i + 2], "big") for i in range(0, len(body), 2)]
+
+
+def _protocol_list(data: bytes) -> list[str]:
+    body, offset = _take_vector(data, 0, 2)
+    if offset != len(data):
+        raise ValueError("ALPN/ALPS 长度无效")
+    names = []
+    cursor = 0
+    while cursor < len(body):
+        size = body[cursor]
+        item = body[cursor + 1:cursor + 1 + size]
+        if len(item) != size:
+            raise ValueError("协议名被截断")
+        name = item.decode("ascii")
+        if name not in ("h2", "http/1.1"):
+            raise ValueError(f"tls_spec 仅支持 ALPN h2/http/1.1，收到 {name!r}")
+        names.append(name)
+        cursor += 1 + size
+    if not names:
+        raise ValueError("协议列表为空")
+    return names
+
+
+def _parse_key_shares(data: bytes) -> list[dict[str, str]]:
+    body, offset = _take_vector(data, 0, 2)
+    if offset != len(data) or not body:
+        raise ValueError("key_share 长度无效")
+    shares = []
+    cursor = 0
+    while cursor < len(body):
+        if cursor + 4 > len(body):
+            raise ValueError("key_share 条目被截断")
+        group = int.from_bytes(body[cursor:cursor + 2], "big")
+        size = int.from_bytes(body[cursor + 2:cursor + 4], "big")
+        cursor += 4 + size
+        if cursor > len(body):
+            raise ValueError("key_share 公钥被截断")
+        name = _tls_name(group, _TLS_GROUPS)
+        if name != "GREASE" and name not in _TLS_GROUPS.values():
+            raise ValueError(f"不支持的 key_share 组 {name}")
+        shares.append({"group": name})
+    return shares
+
+
+def _parse_hello_extension(kind: int, data: bytes) -> dict[str, Any]:
+    if _is_grease_id(kind):
+        return {"name": "GREASE"}
+    if kind == 0:
+        return {"name": "server_name"}
+    if kind == 5:
+        return {"name": "status_request"}
+    if kind == 10:
+        return {"name": "supported_groups", "named_group_list": [_tls_name(item, _TLS_GROUPS) for item in _uint16_list(data, 2)]}
+    if kind == 11:
+        if data != b"\x01\x00":
+            raise ValueError("ec_point_formats 仅支持 uncompressed")
+        return {"name": "ec_point_formats", "ec_point_format_list": ["uncompressed"]}
+    if kind == 13:
+        return {"name": "signature_algorithms", "supported_signature_algorithms": [_tls_name(item, _TLS_SIGNATURES) for item in _uint16_list(data, 2)]}
+    if kind == 16:
+        return {"name": "application_layer_protocol_negotiation", "protocol_name_list": _protocol_list(data)}
+    if kind == 18:
+        return {"name": "signed_certificate_timestamp"}
+    if kind == 23:
+        return {"name": "extended_master_secret"}
+    if kind == 27:
+        body, offset = _take_vector(data, 0, 1)
+        if offset != len(data) or len(body) % 2:
+            raise ValueError("compress_certificate 长度无效")
+        algorithms = []
+        for index in range(0, len(body), 2):
+            item = int.from_bytes(body[index:index + 2], "big")
+            name = _TLS_CERT_COMPRESSION.get(item)
+            if name is None:
+                raise ValueError(f"不支持的证书压缩 {item}")
+            algorithms.append(name)
+        return {"name": "compress_certificate", "algorithms": algorithms}
+    if kind == 35:
+        return {"name": "session_ticket"}
+    if kind == 43:
+        values, offset = _take_vector(data, 0, 1)
+        if offset != len(data) or len(values) % 2:
+            raise ValueError("supported_versions 长度无效")
+        versions = [_tls_name(int.from_bytes(values[i:i + 2], "big"), _TLS_VERSIONS) for i in range(0, len(values), 2)]
+        if any(item.startswith("0x") for item in versions):
+            raise ValueError("supported_versions 仅支持 TLS 1.2/1.3 和 GREASE")
+        return {"name": "supported_versions", "versions": versions}
+    if kind == 45:
+        if data != b"\x01\x01":
+            raise ValueError("psk_key_exchange_modes 仅支持 psk_dhe_ke")
+        return {"name": "psk_key_exchange_modes", "ke_modes": ["psk_dhe_ke"]}
+    if kind == 51:
+        return {"name": "key_share", "client_shares": _parse_key_shares(data)}
+    if kind == 17513:
+        return {"name": "application_settings", "supported_protocols": _protocol_list(data)}
+    if kind == 17613:
+        return {"name": "application_settings_new", "supported_protocols": _protocol_list(data)}
+    if kind == 65037:
+        return {"name": "encrypted_client_hello"}
+    if kind == 65281:
+        return {"name": "renegotiation_info"}
+    raise ValueError(f"不支持的 TLS 扩展 {kind}")
+
+
+def tls_spec_from_client_hello(data: str | bytes | bytearray | memoryview | os.PathLike[str]) -> dict[str, Any]:
+    """把 Wireshark hex dump、原始十六进制或 ClientHello 字节转成 tls_spec。不复制 random、session ID、公钥和 SNI。"""
+    if isinstance(data, os.PathLike) or (isinstance(data, str) and _is_hello_file(data)):
+        raw = Path(data).read_bytes()
+        data = raw if raw[:1] in (b"\x16", b"\x01") else raw.decode("utf-8")
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        payload = bytes(data)
+    elif isinstance(data, str):
+        payload = _parse_hello_hex_text(data)
+    else:
+        raise TypeError("ClientHello 必须是字节、十六进制文本或文件路径")
+    hello = _unwrap_client_hello(payload)
+    offset = 4
+    if offset + 34 > len(hello):
+        raise ValueError("ClientHello 太短")
+    offset += 34
+    _, offset = _take_vector(hello, offset, 1)
+    ciphers, offset = _take_vector(hello, offset, 2)
+    compression, offset = _take_vector(hello, offset, 1)
+    extensions, offset = _take_vector(hello, offset, 2)
+    if offset != len(hello):
+        raise ValueError("ClientHello 存在多余字节")
+    if len(ciphers) < 2 or len(ciphers) % 2 or compression != b"\x00":
+        raise ValueError("cipher_suites 或 compression_methods 无法映射为 tls_spec")
+    spec: dict[str, Any] = {
+        "cipher_suites": [_tls_name(int.from_bytes(ciphers[i:i + 2], "big"), _TLS_CIPHERS) for i in range(0, len(ciphers), 2)],
+        "compression_methods": ["NULL"],
+        "extensions": [],
+        "shuffle_extensions": False,
+    }
+    cursor = 0
+    while cursor < len(extensions):
+        if cursor + 4 > len(extensions):
+            raise ValueError("TLS 扩展被截断")
+        kind = int.from_bytes(extensions[cursor:cursor + 2], "big")
+        size = int.from_bytes(extensions[cursor + 2:cursor + 4], "big")
+        body = extensions[cursor + 4:cursor + 4 + size]
+        if len(body) != size:
+            raise ValueError("TLS 扩展被截断")
+        spec["extensions"].append(_parse_hello_extension(kind, body))
+        cursor += 4 + size
+    versions = next((item["versions"] for item in spec["extensions"] if item.get("name") == "supported_versions"), None)
+    if not versions:
+        raise ValueError("ClientHello 缺少 supported_versions")
+    numeric = [0x0303 if item == "TLS 1.2" else 0x0304 for item in versions if item != "GREASE"]
+    if not numeric:
+        raise ValueError("supported_versions 缺少 TLS 1.2/1.3")
+    spec["min_vers"] = min(numeric)
+    spec["max_vers"] = max(numeric)
+    return spec
+
+
+def _normalize_tls_spec(value: Mapping[str, Any] | str | bytes | bytearray | memoryview | os.PathLike[str]) -> str:
     def reject_duplicate(pairs):
         result = {}
         for key, item in pairs:
@@ -399,14 +654,14 @@ def _normalize_tls_spec(value: Mapping[str, Any] | str) -> str:
             result[key] = item
         return result
 
-    if isinstance(value, str):
+    if isinstance(value, Mapping):
+        value = dict(value)
+    elif isinstance(value, str) and value.lstrip().startswith("{"):
         if len(value.encode("utf-8")) > 65536:
             raise ValueError("tls_spec 不能超过 65536 字节")
         value = json.loads(value, object_pairs_hook=reject_duplicate)
-    elif isinstance(value, Mapping):
-        value = dict(value)
     else:
-        raise TypeError("tls_spec 必须是 JSON 对象或 JSON 字符串")
+        value = tls_spec_from_client_hello(value)
     if not isinstance(value, dict):
         raise TypeError("tls_spec 必须是 JSON 对象")
     required = {"cipher_suites", "compression_methods", "extensions"}
@@ -1332,7 +1587,7 @@ class _ManagedAsyncGoTransport(_ManagedState, httpx.AsyncBaseTransport):
 def _resolve_client_options(
     client_options: ClientOptions | None,
     tls_fingerprint: TLSFingerprint | str | None,
-    tls_spec: Mapping[str, Any] | str | None,
+    tls_spec: Mapping[str, Any] | str | bytes | os.PathLike[str] | None,
     impersonate: Impersonate | str | None,
     verify: bool | str | os.PathLike[str] | ssl.SSLContext | object,
     cert: str | os.PathLike[str] | tuple[str | os.PathLike[str], str | os.PathLike[str]] | object,
@@ -1413,7 +1668,7 @@ class Client(httpx.Client):
         go_token: str | None = None,
         client_options: ClientOptions | None = None,
         tls_fingerprint: TLSFingerprint | str | None = None,
-        tls_spec: Mapping[str, Any] | str | None = None,
+        tls_spec: Mapping[str, Any] | str | bytes | os.PathLike[str] | None = None,
         impersonate: Impersonate | str | None = None,
         verify: bool | str | os.PathLike[str] | ssl.SSLContext | object = _UNSET,
         cert: str | os.PathLike[str] | tuple[str | os.PathLike[str], str | os.PathLike[str]] | object = _UNSET,
@@ -1490,7 +1745,7 @@ class AsyncClient(httpx.AsyncClient):
         go_token: str | None = None,
         client_options: ClientOptions | None = None,
         tls_fingerprint: TLSFingerprint | str | None = None,
-        tls_spec: Mapping[str, Any] | str | None = None,
+        tls_spec: Mapping[str, Any] | str | bytes | os.PathLike[str] | None = None,
         impersonate: Impersonate | str | None = None,
         verify: bool | str | os.PathLike[str] | ssl.SSLContext | object = _UNSET,
         cert: str | os.PathLike[str] | tuple[str | os.PathLike[str], str | os.PathLike[str]] | object = _UNSET,

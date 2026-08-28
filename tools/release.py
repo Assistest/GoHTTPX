@@ -71,6 +71,7 @@ def write_release_notes(version):
         "```powershell", f'python -m pip install --upgrade --only-binary=gohttpx "gohttpx=={version}"', "```", "",
         "## 主要变化", "",
         "- 新增 `tls_spec`：自定义 uTLS ClientHello JSON；与内置指纹、impersonate 互斥，校验失败不回退默认指纹。",
+        "- 新增 `tls_spec_from_client_hello`：Wireshark hex dump、ClientHello 字节或文件路径可直接转成 tls_spec，不重放抓包动态字段。",
         "- 每个 Python 进程自动托管一份 Go，动态端口；不同 client 的 session 和 Cookie 隔离。",
         "- Python 结束后通过 Windows Job 回收 Go；Go 崩溃后自动恢复，结果不确定的在途请求不会被自动重放。",
         "- 外部服务模式需显式 go_endpoint；单独传 go_token 不再选择旧固定端口。不能只复制 gohttpx.py，Linux/macOS 托管尚不支持。",

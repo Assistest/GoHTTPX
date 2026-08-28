@@ -1,6 +1,6 @@
 # TLS JSON 配置与实际报文验证
 
-适用于源码版本 2.1.0。Python SDK 与 Go EXE 必须同版本；旧版不具备此入口。
+适用于源码版本 2.1.1。Python SDK 与 Go EXE 必须同版本；旧版不具备此入口。`tls_spec` JSON 自 2.1.0 起可用，ClientHello hex 导入自 2.1.1 起可用。
 
 自定义 TLS 只用于你有权测试的接口请求。禁止用于未授权访问、绕过安全控制或任何违法用途，完整条款见 [README 免责声明](../README.md#免责声明)。
 
@@ -39,6 +39,17 @@ asyncio.run(main())
 仅支持 TLS 1.2/1.3。`supported_versions`、`signature_algorithms` 扩展必须存在；TLS 1.3 要求有效的 TLS 1.3 套件及真实 KeyShare。配置最多 64 KiB、8 层嵌套。重复 JSON key、未知字段、null、错误类型和不兼容配置明确拒绝。Python 接受对象或 JSON 字符串，控制协议传递 JSON 对象，不是二次编码的字符串。
 
 字段名沿用 uTLS JSON 格式，不能使用此前设计草案里的 `type`、`alpn`、`groups` 等简写。加密套件/组/签名算法的十六进制编号必须写成字符串，例如 `"0x0904"`，不能在 JSON 中写裸 `0x0904`。
+
+## 从 ClientHello hex 导入
+
+`gohttpx.tls_spec_from_client_hello()` 以及 `Client(tls_spec=...)` 可直接吃：
+
+- Wireshark 包字节文本（带偏移列，如 `0000   16 03 01 ...`）
+- 连续十六进制字符串
+- TLS record 或 handshake 原始字节
+- 上述内容的文件路径
+
+转换结果是当前接口能表达的配置，不是原包逐字节重放。random、session ID、KeyShare 公钥、GREASE 具体编号和 SNI 主机名都会丢弃，由新连接生成。`encrypted_client_hello` 只声明 GREASE ECH，不能还原抓包中的 AEAD/payload。未知扩展会报错，不会填成 GenericExtension。
 
 ## 支持的扩展
 

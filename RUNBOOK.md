@@ -36,7 +36,7 @@
 - Python 卡死但进程不退出不会触发 Job 回收；应用 watchdog 由部署系统负责。
 - 多个 worker 分别拥有一个 Go，资源用量随 worker 数量增加。
 - 安装包不在业务运行时联网下载或编译。源码构建需要 Go 工具链；部署应使用预构建 wheel。
-- 部署使用 `python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.0"`；也可安装 GitHub Release 中的同版本 Windows wheel。
+- 部署使用 `python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.1"`；也可安装 GitHub Release 中的同版本 Windows wheel。
 
 开发可在第一次使用前指定 `configure_runtime(binary_path=绝对路径)`，该 EXE 必须与 SDK 同版本。修改配置前先关闭旧 client 和运行时。
 

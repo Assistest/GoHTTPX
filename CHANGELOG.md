@@ -1,5 +1,9 @@
 # 更新记录
 
+## 2.1.1（2026-08-28）
+
+- Python 新增 `tls_spec_from_client_hello`；`tls_spec` 可直接接受 Wireshark hex dump、ClientHello 字节或文件路径，转换成现有 JSON，不重放抓包动态字段。
+
 ## 2.1.0（2026-08-28）
 
 - Python `Client`、`AsyncClient`、`ClientOptions` 新增 `tls_spec`，接受 JSON 对象/字符串；Go 严格校验并使用自定义 uTLS ClientHello，不回退内置指纹。

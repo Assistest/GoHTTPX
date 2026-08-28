@@ -15,7 +15,7 @@ from unittest.mock import patch
 import httpx
 
 from e2e_support import ConnectProxyFixture, GoHTTPXService, Socks5ProxyFixture, TransportTarget
-from gohttpx import AsyncClient, Client, ClientOptions, GoProtocolError, Impersonate, TLSFingerprint, TransportOptions
+from gohttpx import AsyncClient, Client, ClientOptions, GoProtocolError, Impersonate, TLSFingerprint, TransportOptions, tls_spec_from_client_hello
 from tls_test_support import TLSCaptureTarget, load_readme_tls_demo
 import gohttpx
 
@@ -70,6 +70,24 @@ class TransportE2ETests(unittest.TestCase):
         self.assertEqual(observed["tls_version"], "TLSv1.3")
         self.assertEqual(observed["alpn"], "http/1.1")
         return extensions[51][11:]
+
+    def test_client_hello_hex_round_trip_preserves_declared_fields(self):
+        spec = self.custom_hello()
+        with TLSCaptureTarget(self.target) as target:
+            with Client(go_endpoint=self.service.endpoint, go_token=self.service.token,
+                        verify=self.target.ca_path, tls_spec=spec) as client:
+                first = client.get(target.endpoint).json()
+        converted = tls_spec_from_client_hello(bytes.fromhex(first["raw_hello"]))
+        with TLSCaptureTarget(self.target) as target:
+            with Client(go_endpoint=self.service.endpoint, go_token=self.service.token,
+                        verify=self.target.ca_path, tls_spec=converted) as client:
+                second = client.get(target.endpoint).json()
+        normalize = lambda value: 0x0A0A if value & 0x0F0F == 0x0A0A and value >> 8 == value & 255 else value
+        self.assertEqual([normalize(item) for item in first["hello"]["cipher_suites"]],
+                         [normalize(item) for item in second["hello"]["cipher_suites"]])
+        self.assertEqual([normalize(ext["id"]) for ext in first["hello"]["extensions"]],
+                         [normalize(ext["id"]) for ext in second["hello"]["extensions"]])
+        self.assertNotEqual(first["hello"]["random"], second["hello"]["random"])
 
     def test_custom_tls_json_is_visible_in_actual_client_hello_and_regenerates_keys(self):
         with TLSCaptureTarget(self.target) as target:
