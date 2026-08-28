@@ -40,7 +40,7 @@ const (
 	retryBackoff         = "backoff"
 )
 
-var serverVersion = "1.0.2"
+var serverVersion = "2.0.0"
 
 func versionLine() string {
 	versions := map[string]string{}
@@ -411,6 +411,7 @@ type responseEnvelope struct {
 
 type server struct {
 	token        string
+	instanceID   string
 	maxBodyBytes int64
 	idleTTL      time.Duration
 	clients      map[string]*clientSession
@@ -453,6 +454,9 @@ func (s *server) routes() http.Handler {
 	mux.Handle("POST /api/v1/clients", s.authenticate(requireJSONContentType(http.HandlerFunc(s.handleCreateClient))))
 	mux.Handle("DELETE /api/v1/clients/{clientID}", s.authenticate(http.HandlerFunc(s.handleDeleteClient)))
 	mux.Handle("POST /api/v1/clients/{clientID}/requests", s.authenticate(requireJSONContentType(http.HandlerFunc(s.handleRawRequest))))
+	if s.instanceID != "" {
+		return s.authenticate(mux)
+	}
 	return mux
 }
 
@@ -478,7 +482,11 @@ func requireJSONContentType(next http.Handler) http.Handler {
 
 func (s *server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.token)) == 1 {
+		if s.instanceID != "" {
+			w.Header().Set(instanceHeader, s.instanceID)
+		}
+		identityOK := s.instanceID == "" || r.Header.Get(instanceHeader) == s.instanceID
+		if identityOK && (s.token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.token)) == 1) {
 			next.ServeHTTP(w, r)
 			return
 		}

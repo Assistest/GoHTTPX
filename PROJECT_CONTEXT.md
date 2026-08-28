@@ -1,6 +1,6 @@
 # GoHTTPX 项目上下文与开发规范
 
-> 文档状态：GoHTTPX v1 的项目宪章。后续开发开始前必须先阅读本文。
+> 文档状态：GoHTTPX 2.0 项目规范，业务控制协议仍为 v1。后续开发开始前必须先阅读本文。
 >
 > 适用范围：当前 GoHTTPX 独立仓库根目录。
 
@@ -14,7 +14,7 @@ GoHTTPX 是一个长期运行在本机 loopback 的 Go HTTP 发包服务，以�
 
 - Python 后端内部有站点 A、站点 B 等多个业务模块。
 - 只有确实需要特殊 TLS/HTTP 能力的请求才使用 GoHTTPX。
-- Go 服务由运维或开发者手动启动并长期运行，Python 不负责启动或停止它。
+- 默认由所属 Python 自动启动、动态分配端口、自动回收和恢复；显式外部模式保留手动部署。
 - 多个 Python `Client`/`AsyncClient` 可以共享同一个 Go 服务进程，但各自拥有独立的 Go session。
 
 ## 2. 强制项目边界
@@ -91,15 +91,15 @@ Go/req 负责：
 
 ## 4. 进程与 session 模型
 
-- Go 服务是一个手动启动、长期存在的独立进程。
+- 默认每个 Python 进程托管一个长期存在的 Go 子进程；Windows 在创建时原子加入专属 Job。
 - 同步 `Client` 构造时立即创建 Go session。
 - 异步 `AsyncClient` 在第一次请求时懒创建 Go session。
 - 每个已创建会话的 Python client 对应一个独立 req client。
 - 关闭一个 Python client 只能删除自己的 Go session。
-- Go 服务重启或空闲清理造成 session 丢失时，只能在收到完整、严格的 `CLIENT_NOT_FOUND` 后自动重建一次。
+- 托管 Go 重启时，按新实例快照重建各 client session；同一实例内完整 `CLIENT_NOT_FOUND` 也允许一次重建。
 - 控制连接断开、超时或响应不完整时，不得自动重发 POST，因为无法确认目标请求是否已经执行。
 
-Python 不为每个站点、每个请求或每个协程启动 Go 子进程。
+Python 不为每个站点、每个请求或每个协程启动 Go 子进程。关闭最后一个 client 不结束健康 Go；应用退出或显式 shutdown 才结束运行时。恢复只允许一次额外安全尝试，结果不确定不得重放。
 
 ## 5. v1 控制协议
 
@@ -111,7 +111,7 @@ Python 不为每个站点、每个请求或每个协程启动 Go 子进程。
 - `DELETE /api/v1/clients/{client_id}`
 - `POST /api/v1/clients/{client_id}/requests`
 
-除 health 外，正式模式使用 bearer token。只有显式 `--insecure-no-auth` 的本机调试模式免鉴权。
+外部模式除 health 外使用 bearer token；托管模式所有控制路由同时校验自动生成的 token 与实例 ID。业务 v1 JSON 不添加实例字段。
 
 ### 5.2 Canonical JSON
 
@@ -280,14 +280,14 @@ H2C 必须通过真实 cleartext HTTP/2 服务验证，不能只断言配置标�
 
 ## 11. 错误与日志
 
-Go 服务不输出启动日志或请求日志。
+Go 不输出业务请求日志；托管 stdout 专供启动协议。Python 的 gohttpx.runtime 命名 logger 可提供不含敏感材料的生命周期事件。
 
 - 控制 API 错误直接返回 JSON error envelope。
 - Python 将上游 timeout 映射为 `httpx.TimeoutException`。
 - DNS、connect、TLS 错误映射为 `httpx.ConnectError`。
 - 上游协议错误映射为 `httpx.RemoteProtocolError`。
 - 其他控制协议错误映射为 `GoProtocolError`。
-- 本地 Go 服务不可用映射为 `GoServiceUnavailable`。
+- 托管服务未就绪/明确未发送，以及外部服务不可用映射为 `GoServiceUnavailable`；托管已提交后结果不确定映射为 `GoRequestOutcomeUnknown`，不能继承 ConnectError。
 - 异常保留原目标 `httpx.Request`、`code` 和可用的 `request_id`。
 
 Python 页面层可以捕获这些异常并决定如何展示。GoHTTPX 不包含前端页面，也不引入业务日志系统。
@@ -298,7 +298,7 @@ Python 页面层可以捕获这些异常并决定如何展示。GoHTTPX 不包�
 
 - 默认只能监听 loopback。
 - 非 loopback 必须显式 `--allow-non-loopback`，并由部署方承担网络隔离责任。
-- 正式模式必须设置 `GOHTTPX_TOKEN` 或 `--token`。
+- 外部正式模式设置 `GOHTTPX_TOKEN` 或 `--token`；托管凭证由 SDK 自动生成，不接受外部密钥、不读取该环境变量。
 - `--insecure-no-auth` 只允许本机调试。
 - token 只用于控制 API，不能进入目标 headers、trace、dump 或错误消息。
 - 请求体、证书 PEM、header 数组和响应正文都有硬限制。
@@ -345,10 +345,12 @@ Go 使用本机测试服务覆盖：
 
 ### 14.2 Python 测试
 
-Python 测试分两层：
+Python 测试分四层：
 
 1. Fake control service：精确测试 SDK 编解码、错误、并发、取消和 session 重建。
 2. 真实 E2E：构建单个临时 Go EXE，启动本机目标站，再通过公开 `Client`/`AsyncClient` 请求。
+3. Windows 托管故障注入：由独立观察进程验证父进程死亡、启动窗口、隔离、崩溃、恢复、取消和资源回收。
+4. 安装测试：独立虚拟环境、移除 Go PATH、使用 wheel 内置二进制完成请求及退出回收。
 
 真实 E2E 必须覆盖：
 
@@ -365,7 +367,44 @@ Python 测试分两层：
 - token 不泄漏
 - async client
 
-测试只访问 loopback，不依赖公网。
+网络行为测试只访问 loopback；构建/安装依赖可能访问软件源。
+
+### 14.3 固定位置与测试发现
+
+| 内容 | 固定位置 | 执行方式 |
+|---|---|---|
+| Go 服务单元与集成测试 | 与被测 Go 包同目录的 `*_test.go`，当前为根目录 `api_test.go`、`main_test.go`、`managed_test.go` | `go test ./... -count=1` |
+| Python SDK、真实 E2E、托管生命周期、安装及发布约束测试 | `python/test_*.py` | `python -B -m unittest discover -s python -p "test_*.py" -v` |
+| 本机目标服务与辅助进程 | `testdata/`、`python/` 中的测试辅助模块 | 由对应正式用例启动，不单独计为回归用例 |
+| 验证报告 | `docs/testing/` | 记录实际执行结果，不替代可运行测试 |
+| 临时诊断脚本、日志和构建产物 | `.tmp/`，发布构建产物为 `dist/`、`build/` | 不属于正式回归，用完按文件清理临时脚本 |
+
+Go 测试需要访问包内实现，不为集中目录而移出被测包。Python 沿用现有 `python/` 测试发现入口，不新增默认命令无法发现的散落用例。新增正式用例必须确认已被默认命令收集。
+
+### 14.4 每次修改的回归与预期约束
+
+既有用例的预期代表已接受的行为，默认保持不变：
+
+1. 开始代码修改前确认相关测试基线；修复缺陷先增加可复现的失败用例。
+2. 代码修改完成后先跑受影响用例，再 fresh 执行下方完整回归。不得用之前某次通过记录代替本次执行。
+3. 新增功能同时补正常、异常、边界用例；并发、Cookie 隔离、重启、退出与请求重放规则有改动时补对应实际行为验证。
+4. 测试失败应先定位原因。禁止为了通过而降低断言强度、扩大容差、删除或跳过用例；不能让测试追随错误实现。
+5. 只有需求明确改变被测行为，或有证据证明用例、测试数据本身有误，才允许同步调整预期；必须说明旧预期、新预期及依据。单纯重构、修复实现或更换测试数据不自动授权改变行为预期。
+6. 报告命令、结果、失败及跳过原因；平台不支持或环境依赖缺失属于验证边界，不能算作通过。
+
+从仓库根目录依次执行，任一步失败先处理，不得把部分通过报告成整体通过：
+
+```powershell
+go test ./... -count=1
+go test -race ./... -count=1
+go vet ./...
+python -m build
+python -B -m unittest discover -s python -p "test_*.py" -v
+```
+
+构建当前源码的 wheel 必须在 Python 安装测试之前，避免 `dist/` 的旧包掩盖源码回归。CI 同样按此顺序执行。测试依赖需要 `httpx`、`cryptography` 和 `build`。
+
+临时排查不能冒充正式回归。例如内存采样记录只反映一次环境下的曲线，不应断言进程必须降回启动时的固定 MB 数；若要将其转为正式用例，必须定义可重复的本机负载、采样口径和有依据的容差，并保存在上述测试位置。
 
 ## 15. 发布门槛
 
@@ -375,6 +414,7 @@ Python 测试分两层：
 go test ./... -count=1
 go test -race ./... -count=1
 go vet ./...
+python -m build
 python -B -m unittest discover -s python -p "test_*.py" -v
 ```
 
@@ -391,7 +431,7 @@ gohttpx-server.exe --version
 - `vcs.modified=false`。
 - EXE SHA-256 和大小写入发布记录。
 - health、capabilities、graceful shutdown 实际运行通过。
-- stdout/stderr 没有启动或请求日志。
+- stdout/stderr 没有业务请求日志或敏感材料；托管 stdout 允许私有启动消息。
 - 工作树没有未提交源码修改。
 
 公开 GitHub 发布时，发布记录以对应 GitHub Release 为准；其中必须写明版本、clean revision、EXE SHA-256 和字节数。手动部署步骤见 `RUNBOOK.md`，变更摘要见 `CHANGELOG.md`。
@@ -445,8 +485,8 @@ gohttpx-server.exe --version
 
 ## 18. 当前固定版本
 
-- GoHTTPX server：`1.0.0`
-- Python SDK：`1.0.0`
+- GoHTTPX server：`2.0.0`
+- Python SDK：`2.0.0`
 - protocol：`1`
 - Python：`>=3.10`
 - HTTPX：`>=0.28,<0.29`
@@ -468,9 +508,11 @@ gohttpx-server.exe --version
 - [ ] 同步和异步行为一致。
 - [ ] 并发、取消、close 和 session 重建已考虑。
 - [ ] TLS + mTLS、proxy 和 HTTP 版本组合没有静默降级。
-- [ ] 没有新增启动日志、请求日志或敏感数据输出。
+- [ ] 没有新增业务请求日志或敏感数据输出；托管机器消息和命名生命周期日志符合设计。
 - [ ] 已先写能复现问题的测试。
 - [ ] full/race/vet/Python E2E 已 fresh 通过。
 - [ ] README、本文和发布记录已同步。
 
 如任一项无法明确回答，先停止编码并补充设计或测试。
+
+自动托管的详细约束见 [设计](docs/design/2026-08-27-managed-runtime.md)，当前测试证据见 [验证记录](docs/testing/2026-08-27-managed-runtime.md)。默认平台仅 Windows amd64；Unix 托管尚未实现，不能以普通子进程替代回收保证。

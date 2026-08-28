@@ -169,7 +169,7 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             200,
             {
                 "protocol_version": 1,
-                "server_version": "1.0.2",
+                "server_version": "2.0.0",
                 "max_body_bytes": 48 << 20,
                 "tls_fingerprints": FINGERPRINTS,
             },
@@ -338,7 +338,7 @@ class ClientTests(unittest.TestCase):
         self.thread.join()
 
     def test_enum_matches_go_capabilities_and_default_create_contract(self):
-        self.assertEqual(__version__, "1.0.2")
+        self.assertEqual(__version__, "2.0.0")
         self.assertEqual({item.value for item in TLSFingerprint}, set(FINGERPRINTS))
         self.assertEqual(len(TLSFingerprint), 49)
         client = Client(go_endpoint=self.endpoint, go_token="secret")
@@ -710,7 +710,7 @@ class ClientTests(unittest.TestCase):
     def test_capabilities_require_exact_valid_compatible_fields(self):
         valid = {
             "protocol_version": 1,
-            "server_version": "1.0.2",
+            "server_version": "2.0.0",
             "max_body_bytes": 48 << 20,
             "tls_fingerprints": FINGERPRINTS,
         }
@@ -852,6 +852,7 @@ class ClientTests(unittest.TestCase):
     def test_unavailable_service_has_github_guidance(self):
         transport = gohttpx._GoTransport.__new__(gohttpx._GoTransport)
         transport._endpoint = "http://127.0.0.1:1"
+        transport._instance_id = None
         transport._control = httpx.Client(
             transport=httpx.MockTransport(
                 lambda request: (_ for _ in ()).throw(httpx.ConnectError("down", request=request))

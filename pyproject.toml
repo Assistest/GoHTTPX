@@ -1,16 +1,16 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gohttpx"
-version = "1.0.2"
+version = "2.0.0"
 description = "通过本地 Go 服务扩展 HTTPX 请求能力"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
 ]
@@ -21,4 +21,8 @@ Homepage = "https://github.com/Assistest/GoHTTPX"
 
 [tool.setuptools]
 package-dir = {"" = "python"}
-py-modules = ["gohttpx"]
+py-modules = ["gohttpx", "_gohttpx_runtime", "_gohttpx_windows"]
+packages = ["_gohttpx_bin"]
+
+[tool.setuptools.package-data]
+_gohttpx_bin = ["*.exe"]

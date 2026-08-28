@@ -1,165 +1,134 @@
-# GoHTTPX Bridge v1
+# GoHTTPX 2.0
 
-## Python PyPI 安装
+GoHTTPX 保留 HTTPX 的请求编码、Cookie、认证、重定向和 Response 语义，由本地 Go 执行 TLS 指纹、代理及 HTTP/1/2/3 请求。
+
+**2.0 默认自动托管 Go：每个 Python 进程一份 Go，多个 client 共用进程，但各自拥有独立 session 和 Cookie。** 不需要手动启动服务，不需要配置端口或请求密钥。
+
+当前版本为 `2.0.0`，控制协议仍为 `/api/v1`、`protocol_version=1`。发布产物见 [PyPI](https://pypi.org/project/gohttpx/) 和 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases)。
+
+## 安装与最小用法
+
+默认托管支持 Windows 10+/Windows Server 2016+，安装包平台为 Windows amd64，Python 3.10+、`httpx>=0.28,<0.29`。其他平台尚未实现同等级进程回收，不能使用默认托管模式。
+
+从 PyPI 安装，Go EXE 随 wheel 一起安装，无需另行下载：
 
 ```powershell
-pip install gohttpx
+python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.0.0"
 ```
 
-Go 服务端不属于 pip 包。请从 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases) 获取与 Python SDK 同标签的 Windows amd64 安装包，并校验随附 SHA-256 文件。Go 服务端不可达时会抛出 `GoServiceUnavailable`，消息会指向 Releases 地址。
+`--only-binary=gohttpx` 避免在不支持的平台意外回退到源码编译；本版本不提供 Linux/macOS 托管安装包。
+
+开发者也可以在仓库构建并安装本地 wheel（仅构建机器需要 Go 工具链）：
+
+```powershell
+python -m pip install build
+python -m build
+python -m pip install dist\gohttpx-2.0.0-py3-none-win_amd64.whl
+```
+
+wheel 内置匹配版本的 Go EXE。部署机器安装 wheel 后不需要 Go 编译器；第一次请求不下载、不编译任何程序。2.0 不再支持只复制一个 `gohttpx.py` 即完成接入。
 
 ```python
-from gohttpx import Client, GoServiceUnavailable
-
-try:
-    with Client(go_token="replace-with-secret") as client:
-        client.get("https://example.test/")
-except GoServiceUnavailable as error:
-    print(error)
-```
-
-GoHTTPX 在本机常驻一个 Go 发包服务，让 Python 继续使用 HTTPX 0.28 的 `Client`、`AsyncClient`、请求编码、cookies、auth、redirect 和 `Response` 语义，同时把目标请求交给 req/v3、uTLS 或 HTTP/3 Transport 执行。
-
-当前发布版本为 `1.0.0`，控制协议为 `/api/v1`、`protocol_version=1`。依赖固定为 req/v3 `v3.59.0`、quic-go `v0.60.0`、uTLS `v1.8.2`；Python 最低版本为 3.10，要求 `httpx>=0.28,<0.29`。
-
-公开发布与手动部署请同时阅读 [更新记录](CHANGELOG.md) 和 [运维说明](RUNBOOK.md)。每个发布二进制的 SHA-256、大小和源码 revision 以对应 GitHub Release 为准。
-
-## 架构与状态边界
-
-一个由运维人员手动启动的 loopback Go 服务，可以由同一 Python 后端中的多个站点模块共享。同步 `Client` 在构造时立即创建 Go `req.Client` 会话；异步 `AsyncClient` 在第一次请求时懒创建。每个已经创建会话的 client 都对应一个独立 Go session，因此 TLS、代理、HTTP 版本、连接池和重试配置互不串用。
-
-HTTPX 负责 params、headers、cookies、Basic/Digest auth、redirect、`json/data/files/content` 编码以及最终 `Response`；Go 会话只保存底层网络配置。业务 cookies、headers 和 auth 不会在 Go 中持久化，控制 API 的 bearer token 也不会转发给目标站点。Python 不会启动或停止 Go 服务。
-
-```text
-站点模块 -> httpx.Client / httpx.AsyncClient
-         -> GoTransport -> 127.0.0.1 /api/v1
-         -> 独立 req.Client 会话 -> 目标站点
-```
-
-## Windows 构建与启动
-
-在本目录执行：
-
-```powershell
-go build -trimpath -ldflags="-s -w" -o gohttpx-server.exe .
-.\gohttpx-server.exe --host 127.0.0.1 --port 9876 --token <secret>
-```
-
-也可以把 token 放入当前进程环境。显式 `--token` 的优先级高于 `GOHTTPX_TOKEN`：
-
-```powershell
-$env:GOHTTPX_TOKEN = "replace-with-a-long-random-secret"
-.\gohttpx-server.exe --host 127.0.0.1 --port 9876
-```
-
-正式模式 token 不能为空。只有明确传入 `--insecure-no-auth` 才会关闭鉴权，该模式仅用于本机开发。默认禁止监听非 loopback 地址；`--allow-non-loopback` 是显式危险开关，本机 bearer 设计不应被当作公网认证方案。
-
-常用 CLI：
-
-| 参数 | 默认值 | 含义与边界 |
-|---|---:|---|
-| `--host` | `127.0.0.1` | 监听地址；非 `localhost`/loopback 必须同时传 `--allow-non-loopback`。 |
-| `--port` | `9876` | `1..65535`。 |
-| `--token` | `GOHTTPX_TOKEN` | bearer token；显式参数覆盖环境变量。 |
-| `--insecure-no-auth` | `false` | 清空 token 并关闭鉴权，仅限开发。 |
-| `--allow-non-loopback` | `false` | 允许非 loopback 监听。 |
-| `--max-body-mib` | `48` | 单次目标请求正文和响应正文的内存上限，正整数 MiB。 |
-| `--idle-ttl` | `24h` | 无活动 Go 会话的回收时间，必须大于 0。 |
-| `--version` | `false` | 不需要 token、不会监听端口，打印 server、protocol、req/v3、uTLS 实际构建版本后退出 0。 |
-
-版本、健康和能力检查：
-
-```powershell
-.\gohttpx-server.exe --version
-Invoke-RestMethod http://127.0.0.1:9876/api/v1/health
-Invoke-RestMethod http://127.0.0.1:9876/api/v1/capabilities -Headers @{Authorization="Bearer $env:GOHTTPX_TOKEN"}
-```
-
-`health` 无需鉴权，固定返回 `status`、`protocol_version`、`server_version`。正常模式下 `capabilities` 需要 bearer；只有显式使用 `--insecure-no-auth` 的本机调试模式才免鉴权。v1 capabilities 精确返回四个字段：`protocol_version`、`server_version`、`max_body_bytes`、`tls_fingerprints`。
-
-## Python 单文件接入
-
-把 `python/gohttpx.py` 复制到项目的可导入目录；它不是已发布的 pip 包。项目需自行安装兼容的 HTTPX 0.28.x。同步客户端在构造时检查 capabilities 并创建 Go 会话；异步客户端在第一次请求时懒创建会话。
-
-### 同步示例
-
-```python
-import httpx
-
-from gohttpx import Client, RequestOptions
-
-with Client(
-    go_endpoint="http://127.0.0.1:9876",
-    go_token="replace-with-secret",
-    headers={"User-Agent": "my-backend/1.0"},
-    cookies={"site": "one"},
-    follow_redirects=True,
-) as client:
-    query = client.get("https://example.test/search", params=[("q", "a"), ("q", "b")])
-    created = client.post("https://example.test/items", json={"name": "test"})
-    form = client.post("https://example.test/form", data={"name": "test"})
-    upload = client.post("https://example.test/upload", files={"file": ("a.bin", b"abc")})
-    raw = client.post("https://example.test/raw", content=b"\x00\xff")
-    traced = client.get(
-        "https://example.test/trace",
-        extensions={"go_req": RequestOptions(trace=True, dump=True, retry_count=1)},
-    )
-
-    created.raise_for_status()
-    print(query.url, form.status_code, upload.headers, raw.content)
-    print(traced.extensions.get("go_trace"))
-    print(traced.extensions.get("go_dump"))
-```
-
-`json`、`data`、`files`、`content` 都是 HTTPX 原生参数；HTTPX 先编码最终 bytes，Go 原样发送。默认 headers、cookies、重复 query、redirect history 也由 HTTPX 处理。
-
-Basic 与 Digest auth 使用 HTTPX 的真实 auth 对象：
-
-```python
-import httpx
-
 from gohttpx import Client
 
-with Client(go_token="secret", auth=("user", "pass")) as client:
-    basic = client.get("https://example.test/basic")
-
-with Client(go_token="secret", auth=httpx.DigestAuth("user", "pass")) as client:
-    digest = client.get("https://example.test/digest")
+with Client(follow_redirects=True) as client:
+    response = client.get("https://example.com/")
+    print(response.status_code)
 ```
 
-### 异步示例
+异步调用：
 
 ```python
 import asyncio
-
 from gohttpx import AsyncClient
 
-
-async def main() -> None:
-    async with AsyncClient(
-        go_endpoint="http://127.0.0.1:9876",
-        go_token="replace-with-secret",
-        headers={"X-Site": "demo"},
-        cookies={"session": "one"},
-        follow_redirects=True,
-    ) as client:
-        response = await client.post(
-            "https://example.test/items",
-            params=[("source", "a"), ("source", "b")],
-            json={"name": "async"},
-        )
-        response.raise_for_status()
-        print(response.json(), response.history)
-
+async def main():
+    async with AsyncClient() as client:
+        response = await client.get("https://example.com/")
+        print(response.status_code)
 
 asyncio.run(main())
 ```
 
-`Client` 和 `AsyncClient` 的会话配置入口是 `client_options=ClientOptions(...)`；`tls_fingerprint`、`impersonate`、`verify`、`cert`、`proxy`、`http1`、`http2` 是当前签名支持的固定会话便利参数。单次 `RequestOptions` 不属于构造参数，只能放在 `extensions={"go_req": ...}`。公开签名还接受 HTTPX 的 `auth`、`params`、`headers`、`cookies`、`timeout`、`follow_redirects`、`max_redirects`、`event_hooks`、`base_url`、`default_encoding`；`transport` 与 `mounts` 明确禁止，避免绕过 Go Transport。
+同步 client 构造时启动/连接 Go 并创建 session；异步 client 在首次请求时初始化。`import gohttpx` 不启动 Go。
 
-当前签名正式不提供 `limits` 或 `trust_env` 便利参数。HTTPX 的全局/按 URL 环境代理规则无法无损映射到一个配置固定的 Go session，控制连接也固定不读取代理环境变量；连接池和固定代理分别使用 `ClientOptions.transport` 与 `ClientOptions.proxy_url` 显式配置。`proxy=` 便利参数同样只生成一个固定会话代理，不表示支持环境代理或 per-URL mounts。
+## 进程、session 与 Cookie
 
-`go_token=None` 时读取 `GOHTTPX_TOKEN`；显式字符串（包括空字符串）不再读取环境变量。
+```text
+Python 进程 A                         Python 进程 B
+  Client A1 → Cookie A1 → session A1    Client B1 → Cookie B1 → session B1
+  Client A2 → Cookie A2 → session A2    Client B2 → Cookie B2 → session B2
+                  ↓                                  ↓
+             Go A / 动态端口 A                  Go B / 动态端口 B
+```
+
+- 每次接口请求创建一个 client，只创建/删除轻量 Go session，不反复启动 EXE。
+- 关闭最后一个 client 后，健康 Go 仍保留到 Python 退出或显式 `shutdown()`。
+- Cookie Jar 由各自的 HTTPX client 保存，按域名、路径、Secure、过期规则处理；Go Cookie Jar 关闭。不要把不同账号放进同一个 client，也不要显式共享一个底层 CookieJar。
+- Go 重启不会清空 Python 已接收的 Cookie。尚未收到的 Set-Cookie 无法补回，Python 退出后的内存 Cookie 也不会自动保存。
+- 内部 bearer token 和实例 ID 每次启动随机生成，通过私有管道传递；它们不会发给目标网站。用户不用配置密钥，但内部实例鉴权保留，防止 A 的请求被 B 接收。
+- Go 直接绑定 `127.0.0.1:0`，保留 listener 后报告实际端口，没有先找端口再释放的竞争窗口。
+
+Go 在创建时原子加入仅由所属 Python 持有的 Windows Job。Python 正常退出、未捕获异常、`os._exit()`、任务管理器强杀后，由系统回收所属 Go；不会按进程名或裸 PID 批量杀进程。Job 无法创建或绑定时明确失败，不回退成普通子进程。
+
+这里保证的是 Python **进程结束后的回收**，不是严格同时退出，也不保证强杀时业务请求完成。Python 卡死但进程还活着，需要宿主自己的 watchdog。
+
+## 自动恢复与请求安全
+
+后台监视器发现 Go 退出后，在有存活 client 时自动重启；并发请求共用同一次恢复。没有 client 时意外退出可暂缓到下次使用；显式 `start()/astart()` 预热后，即使没有 client 也保持恢复。
+
+默认配置：启动等待 10 秒，关闭宽限 5 秒；健康检查间隔 5 秒、单次 1 秒、连续 3 次失败才替换存活但无响应的 Go。失败按指数退避，滚动 60 秒内达到 5 次失败后冷却 30 秒。目标站的 500、代理失败、目标超时不会直接导致 Go 重启。
+
+服务恢复不等于重跑业务：
+
+| 情况 | 处理 |
+|---|---|
+| 尚未提交目标请求、明确连接失败，未发送，或完整 `CLIENT_NOT_FOUND` | 原调用预算内最多增加一次安全尝试 |
+| 已经发送后读写中断、响应丢失或实例/响应校验失败 | 抛出 `GoRequestOutcomeUnknown`，不自动重发 |
+| 完整响应已收到且通过校验 | 正常返回 |
+
+`GoRequestOutcomeUnknown` 继承 `httpx.TransportError`，不继承 `ConnectError`；包含原始 request、instance_id、可用时的 request_id、`outcome="unknown"`。遇到下单/支付等结果不确定的操作，应按业务标识查询结果。SDK 不会吞掉异常或重跑整个 Python 函数。
+
+## 可选应用生命周期
+
+```python
+import gohttpx
+
+# wheel 部署通常不用配置；开发时可指定匹配版本的 EXE。
+# gohttpx.configure_runtime(binary_path=r"C:\services\gohttpx-server.exe")
+gohttpx.start()  # 可省略；也可以在异步启动钩子 await gohttpx.astart()
+try:
+    with gohttpx.Client() as client:
+        response = client.get("https://example.com/")
+    print(gohttpx.runtime_status())
+finally:
+    gohttpx.shutdown()  # 异步关闭钩子使用 await gohttpx.ashutdown()
+```
+
+不要在每个接口请求结束时调用 `shutdown()`；每个请求仅关闭自己的 client。运行时关闭是应用级操作。
+
+`configure_runtime()` 只能在没有 client、运行时未启动或已关闭时调用，支持 `binary_path`、`startup_timeout`、`shutdown_timeout`、`health_interval`、`health_timeout`、`health_failures`、`restart_limit`、`restart_window`、`cooldown`。时间单位为秒。关闭后的运行时不会被迟到请求复活；若确实需要重新初始化，先关闭旧 client，再显式配置。
+
+`runtime_status()` 返回状态、owner_pid、child_pid、instance_id、endpoint、start_count、restart_count、active_clients、last_exit_code、last_failure、retry_in_seconds，不返回 token。命名 logger `gohttpx.runtime` 可接入应用日志，不调用 basicConfig、不打印业务请求。
+
+## 保留的外部服务模式
+
+显式传 `go_endpoint` 就是外部模式：Python 不启动、不停止、不重启该服务，只管理自己的 session。旧代码如果只传 `go_token`，需要补上原来的 endpoint；不允许猜测连接旧端口还是启动托管实例。
+
+```python
+from gohttpx import Client
+
+with Client(go_endpoint="http://127.0.0.1:9876", go_token="your-secret") as client:
+    response = client.get("https://example.com/")
+```
+
+仅外部模式在 `go_token=None` 时读取 `GOHTTPX_TOKEN`。托管模式忽略此环境变量。外部服务的构建、启动、鉴权和健康检查见 [RUNBOOK](RUNBOOK.md)。
+
+## HTTPX 参数
+
+`json/data/files/content`、params、headers、cookies、Basic/Digest auth、redirect/history 仍由 HTTPX 准备和处理；Go 接收最终 bytes。`client_options=ClientOptions(...)` 设置独立 session 的传输配置，单次选项放在 `extensions={"go_req": RequestOptions(...)}`。
+
+支持 `tls_fingerprint`、`impersonate`、`verify`、`cert`、`proxy`、`http1`、`http2` 等固定会话便利参数。不接受 `transport`、`mounts`，不提供 `limits` 或目标 `trust_env` 的便利映射；固定代理和连接池请用下面的 DTO。控制连接始终 `trust_env=False`。
 
 ## TLS、代理、证书和 HTTP 版本
 
@@ -169,27 +138,26 @@ import httpx
 from gohttpx import Client, ClientOptions, TLSFingerprint
 
 # TLS 指纹
-with Client(go_token="secret", tls_fingerprint=TLSFingerprint.CHROME_120) as client:
+with Client(tls_fingerprint=TLSFingerprint.CHROME_120) as client:
     response = client.get("https://example.test/")
 
 # 固定代理；Proxy 的 auth 和 headers 子集会被序列化
 proxy = httpx.Proxy("http://proxy.example:8080", auth=("user", "pass"), headers={"X-Proxy": "one"})
-with Client(go_token="secret", proxy=proxy) as client:
+with Client(proxy=proxy) as client:
     response = client.get("https://example.test/")
 
 # 自定义根 CA 与 mTLS
 with Client(
-    go_token="secret",
     verify=r"C:\certs\root-ca.pem",
     cert=(r"C:\certs\client.pem", r"C:\certs\client-key.pem"),
 ) as client:
     response = client.get("https://example.test/")
 
 # HTTP/1.1、HTTP/2、HTTP/3、H2C
-http1 = Client(go_token="secret", client_options=ClientOptions(http_version="http1"))
-http2 = Client(go_token="secret", client_options=ClientOptions(http_version="http2"))
-http3 = Client(go_token="secret", client_options=ClientOptions(http_version="http3", tls_fingerprint=None))
-h2c = Client(go_token="secret", client_options=ClientOptions(http_version="h2c"))
+http1 = Client(client_options=ClientOptions(http_version="http1"))
+http2 = Client(client_options=ClientOptions(http_version="http2"))
+http3 = Client(client_options=ClientOptions(http_version="http3", tls_fingerprint=None))
+h2c = Client(client_options=ClientOptions(http_version="h2c"))
 for client in (http1, http2, http3, h2c):
     client.close()
 ```
@@ -317,7 +285,7 @@ for client in (http1, http2, http3, h2c):
 ```python
 from gohttpx import Client, RequestOptions
 
-with Client(go_token="secret") as client:
+with Client() as client:
     response = client.get(
         "https://example.test/",
         extensions={
@@ -346,7 +314,9 @@ v1 JSON 在任何层级都禁止 `null`，每个对象拒绝未知 key。创建�
 
 | 场景/Go code | Python 异常 | retryable 字段 |
 |---|---|---|
-| 本地 Go 服务无法连接、控制连接超时/断开 | `GoServiceUnavailable` | 不适用 |
+| 托管服务未就绪或明确未发送；外部模式控制连接不可用 | `GoServiceUnavailable` | 不适用 |
+| 托管模式已提交后结果不确定 | `GoRequestOutcomeUnknown` | 不适用 |
+| 托管二进制、版本、Job 配置错误 | `RuntimeConfigurationError` | 不适用 |
 | `UPSTREAM_TIMEOUT` | `httpx.TimeoutException` | `true` |
 | `UPSTREAM_DNS_ERROR` | `httpx.ConnectError` | `true` |
 | `UPSTREAM_CONNECT_ERROR` | `httpx.ConnectError` | `true` |
@@ -363,7 +333,7 @@ v1 JSON 在任何层级都禁止 `null`，每个对象拒绝未知 key。创建�
 
 异常会保留原目标 `httpx.Request`；服务错误还暴露 `code` 和可用时的 `request_id`。
 
-只有收到完整、合法的 `CLIENT_NOT_FOUND` JSON 时，Transport 才使用原 ClientOptions 重建一次 Go 会话，并把完全相同的控制 envelope 重发一次。第二次 `CLIENT_NOT_FOUND` 直接抛错。控制连接中断、超时或响应不完整时绝不自动重发，因此不会在执行结果未知时偷偷重复 POST。
+`CLIENT_NOT_FOUND` 允许一次会话重建。托管模式还允许严格确认尚未发送后的安全尝试，两种情况共享最多一次额外尝试预算。已提交后的控制连接中断、超时或响应不完整不重发。外部模式保留原有错误映射与会话重建行为。
 
 ## 限制与安全边界
 
@@ -375,28 +345,32 @@ v1 JSON 在任何层级都禁止 `null`，每个对象拒绝未知 key。创建�
 - Go 不持久化业务 cookies/headers/auth，不跟随 redirect，不使用 CookieJar，不自动字符集转换。
 - `Host`、`User-Agent`、`Content-Length`、`Transfer-Encoding`、连接复用和 HTTP/2 帧仍受 req 与 Go Transport 控制；普通请求 header 的契约以上述“控制协议与 header 契约”为准，不扩展为任意原始 TCP 报文重放。
 - 鉴权仅面向本机 loopback bearer；控制 token 不进入目标请求。
-- Go 服务不输出启动日志或请求日志。控制面错误直接返回 JSON error envelope，Python 映射为带原始 request 的 HTTPX/`GoProtocolError` 异常，页面层可直接捕获并展示。
+- Go 不输出请求日志；托管 stdout 仅用于私有启动消息。控制错误返回 JSON envelope；运行时仅向命名 logger 提供无敏感材料的生命周期事件。
 
 ## 运维与升级
 
-Go 服务应由进程管理器或运维脚本手动常驻启动；Python 进程只连接它。按 Ctrl+C 会触发最多 10 秒的 graceful shutdown，并关闭已登记会话的空闲连接。孤儿会话默认空闲 24 小时后回收；正在执行的会话不会被空闲清理。
+默认托管模式按前文随所属 Python 自动管理；外部模式由部署方管理。升级时安装匹配版本的完整 wheel，或同时更新 SDK 和外部 EXE。Go session 在 client 关闭时删除；遗留空闲 session 默认 24 小时回收，活动请求不会被空闲清理。
 
-两个同步 Client 构造完成后立即对应两个独立 Go session；两个异步 AsyncClient 则在各自第一次请求后才分别拥有独立 session。关闭一个已创建会话的 client 会幂等删除它自己的 session，不影响另一个 client。服务重启导致 session 丢失时，下一次请求按上述 `CLIENT_NOT_FOUND` 规则重建。
-
-v1 发布后，`/api/v1` 的 required/optional key 集合、字段名、类型、默认值和语义保持稳定；optional key 可按约定省略，其他未知 key 一律拒绝。任何协议扩展必须使用新的 `protocol_version` 与 endpoint，或同步升级 Go 服务和 Python SDK 后再发布，不能让单边先接受新字段。Python 包版本与 protocol 版本独立，当前 server/Python 版本均为 `1.0.0`。
+2.0 的生命周期变化没有给业务 v1 JSON 增加字段。后续修改 required/optional key、字段类型或语义，仍须同时修改双方并通过兼容性测试。
 
 ## 测试与离线 E2E
 
-在 `gohttpx` 目录执行：
+每次代码修改完成后，在仓库根目录依次执行：
 
 ```powershell
+go test ./... -count=1
+go test -race ./... -count=1
 go vet ./...
-go test ./...
-go test -race ./...
+python -m build
 python -B -m unittest discover -s python -p "test_*.py" -v
-python -c "from pathlib import Path; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in Path('python').glob('*.py')]"
 ```
+
+Go 正式用例保留在被测包的 `*_test.go`；Python 正式用例统一为 `python/test_*.py`。`docs/testing/` 保存验证报告，`.tmp/` 中的临时诊断不属于正式回归。安装测试前重新构建 wheel，避免测到旧包。
+
+既有测试预期默认不变，禁止为消除失败而删除用例、跳过或放宽断言。只有需求明确改变对应行为，或有证据证明用例有误，才调整预期并说明原因；具体规则见 [项目测试约定](PROJECT_CONTEXT.md#14-测试体系)。
 
 Go 测试使用 `testing/httptest`，Python 使用 `unittest`。Python E2E 会在系统临时目录构建单个临时 EXE，启动本机 Go 服务和本机目标 HTTP 服务，覆盖正文编码、cookies、redirect、Basic/Digest auth、重复 query/header、错误状态、timeout、会话隔离与重建；测试不访问公网，结束后删除该临时 EXE。
 
-运行 Python 全套测试还需要 `cryptography`：`python -m pip install "httpx>=0.28,<0.29" "cryptography"`。
+运行 Python 全套测试还需要 `cryptography` 和 `build`：`python -m pip install "httpx>=0.28,<0.29" "cryptography" "build"`。
+
+托管故障测试在真实 Windows 子进程上执行，覆盖正常/强制退出、启动窗口、崩溃、并发、A/B Cookie、异步取消、退避、旧实例拒绝和资源回收；安装测试在独立虚拟环境运行，并从 PATH 移除 Go。网络行为测试只访问本地目标；构建依赖和 pip 安装可能使用软件源。测试详情见 [验证记录](docs/testing/2026-08-27-managed-runtime.md)。

@@ -102,7 +102,7 @@ func TestVersionFlagNeedsNoTokenAndReportsFixedBuildVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--version failed: %v\n%s", err, output)
 	}
-	want := "GoHTTPX server 1.0.2 protocol 1 req/v3 v3.59.0 uTLS v1.8.2\n"
+	want := "GoHTTPX server 2.0.0 protocol 1 req/v3 v3.59.0 uTLS v1.8.2\n"
 	if string(output) != want {
 		t.Fatalf("--version output = %q, want %q", output, want)
 	}

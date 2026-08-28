@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
@@ -17,22 +17,34 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
       - run: python -m pip install build twine "httpx>=0.28,<0.29" cryptography
       - id: version
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          package_version="$(python -c 'import re; from pathlib import Path; project = re.search(r"(?ms)^\[project\]\s*$(.*?)(?=^\[|\Z)", Path("pyproject.toml").read_text(encoding="utf-8")).group(1); print(re.search(r"(?m)^version\s*=\s*\"([^\"]+)\"\s*$", project).group(1))')"
-          module_version="$(python -c 'import ast; from pathlib import Path; print(next(node.value.value for node in ast.parse(Path("python/gohttpx.py").read_text(encoding="utf-8")).body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)))')"
-          test "$version" = "$package_version"
-          test "$version" = "$module_version"
-          echo "value=$version" >> "$GITHUB_OUTPUT"
-      - run: python -m build
+        run: python tools/release.py validate
+      - run: go vet ./...
+      - run: go test ./... -count=1
+      - run: go test -race ./... -count=1
+      # 保留 checkout 的 VCS 信息，发布前核验 wheel 内置 EXE 的源码提交。
+      - run: python -m build --sdist --wheel
       - run: python -B -m unittest discover -s python -p "test_*.py" -v
       - run: python -m twine check dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: python-distributions
-          path: dist/
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+      - run: python tools/release.py binary
+      - run: python tools/release.py notes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-windows-amd64
+          path: |
+            dist/gohttpx-server-windows-amd64.exe*
+            dist/RELEASE_NOTES.md
+            dist/SHA256SUMS
 
   publish-pypi:
     needs: validate
@@ -46,30 +58,16 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
-  build-binaries:
-    needs: validate
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.25.x"
-      - name: Build server
-        run: $env:GOOS = "windows"; $env:GOARCH = "amd64"; go build -trimpath -ldflags "-s -w -X main.serverVersion=${{ needs.validate.outputs.version }}" -o gohttpx-server-windows-amd64.exe .
-      - name: Write SHA-256
-        shell: pwsh
-        run: $file = "gohttpx-server-windows-amd64.exe"; "$((Get-FileHash -Algorithm SHA256 $file).Hash.ToLower())  $file" | Set-Content -NoNewline "$file.sha256"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: server-windows-amd64
-          path: gohttpx-server-windows-amd64.exe*
-
   github-release:
-    needs: [publish-pypi, build-binaries]
+    needs: [publish-pypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: release-assets/
       - uses: actions/download-artifact@v4
         with:
           pattern: server-*
@@ -77,4 +75,4 @@ jobs:
           path: release-assets/
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" release-assets/* --repo "$GITHUB_REPOSITORY" --title "${GITHUB_REF_NAME}" --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" release-assets/* --repo "$GITHUB_REPOSITORY" --title "${GITHUB_REF_NAME}" --notes-file release-assets/RELEASE_NOTES.md

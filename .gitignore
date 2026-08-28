@@ -8,3 +8,6 @@ dist/
 /gohttpx-server.exe~
 .superpowers/
 .worktrees/
+.tmp/
+build/
+python/_gohttpx_bin/*.exe

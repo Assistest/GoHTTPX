@@ -6,6 +6,8 @@ import os
 import re
 import ssl
 import threading
+import time
+from concurrent.futures import Future
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
 from enum import Enum
@@ -15,7 +17,50 @@ from urllib.parse import quote
 
 import httpx
 
-__version__ = "1.0.2"
+from _gohttpx_runtime import INSTANCE_HEADER, ManagedRuntime, RuntimeConfigurationError, RuntimeUnavailable
+
+__version__ = "2.0.0"
+_runtime = ManagedRuntime(__version__)
+_runtime_lock = threading.RLock()
+
+
+def configure_runtime(**options):
+    global _runtime
+    with _runtime_lock:
+        state = _runtime.status()
+        if state["active_clients"] or state["state"] not in {"STOPPED", "CLOSED"}:
+            raise RuntimeConfigurationError("必须先关闭所有 client 和运行时，再修改托管配置")
+        candidate = ManagedRuntime(__version__, **options)
+        _runtime.shutdown()
+        _runtime = candidate
+
+
+def start():
+    try:
+        _runtime.ensure(pin=True)
+    except RuntimeUnavailable as exc:
+        raise GoServiceUnavailable(str(exc)) from exc
+    return _runtime.status()
+
+
+async def astart():
+    try:
+        await _runtime.ensure_async(pin=True)
+    except RuntimeUnavailable as exc:
+        raise GoServiceUnavailable(str(exc)) from exc
+    return _runtime.status()
+
+
+def runtime_status():
+    return _runtime.status()
+
+
+def shutdown():
+    _runtime.shutdown()
+
+
+async def ashutdown():
+    await asyncio.to_thread(_runtime.shutdown)
 
 
 class TLSFingerprint(str, Enum):
@@ -187,6 +232,14 @@ class GoProtocolError(httpx.TransportError):
         self.request_id = request_id
 
 
+class GoRequestOutcomeUnknown(httpx.TransportError):
+    def __init__(self, message="Go 请求结果不确定，禁止未经业务确认自动重发", *, request=None, instance_id=None, request_id=None):
+        super().__init__(message, request=request)
+        self.instance_id = instance_id
+        self.request_id = request_id
+        self.outcome = "unknown"
+
+
 _UNSET = object()
 _LOCAL_CONTROL_TIMEOUT = 1.0
 _TARGET_TIMEOUT_GRACE = 1.0
@@ -329,7 +382,7 @@ def _retarget_transport_error(error: BaseException, request: httpx.Request) -> B
         )
     if isinstance(error, httpx.TransportError):
         copied = type(error)(str(error), request=request)
-        for name in ("code", "request_id"):
+        for name in ("code", "request_id", "instance_id", "outcome"):
             if hasattr(error, name):
                 setattr(copied, name, getattr(error, name))
         return copied
@@ -411,10 +464,13 @@ def _request_payload(request: httpx.Request, body: bytes) -> dict[str, Any]:
 
 
 class _GoTransport(httpx.BaseTransport):
-    def __init__(self, endpoint: str, token: str | None, options: ClientOptions) -> None:
+    def __init__(self, endpoint: str, token: str | None, options: ClientOptions, *, instance_id=None) -> None:
         self._endpoint = endpoint.rstrip("/")
+        self._instance_id = instance_id
         self._payload = _client_payload(options)
-        headers = {"Authorization": f"Bearer {token}"} if token else None
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if instance_id is not None:
+            headers[INSTANCE_HEADER] = instance_id
         self._control = httpx.Client(headers=headers, trust_env=False)
         self._condition = threading.Condition()
         self._active = 0
@@ -452,6 +508,11 @@ class _GoTransport(httpx.BaseTransport):
         if request is not None and payload is not None and "timeout_ms" in payload:
             timeout_ms = payload["timeout_ms"] if payload is not None else 0
             control_timeout = (timeout_ms / 1000 if timeout_ms else _MAX_TARGET_TIMEOUT) + _TARGET_TIMEOUT_GRACE
+        if self._instance_id is not None and request is not None:
+            remaining = request.extensions.get("_gohttpx_deadline", time.monotonic() + control_timeout) - time.monotonic()
+            if remaining <= 0:
+                raise GoServiceUnavailable("等待恢复已用尽本次请求预算", request=request)
+            control_timeout = min(control_timeout, remaining)
         try:
             response = self._control.request(
                 method,
@@ -460,12 +521,23 @@ class _GoTransport(httpx.BaseTransport):
                 timeout=control_timeout,
             )
         except httpx.TransportError as exc:
+            if self._instance_id is not None and path.endswith("/requests") and not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+                raise GoRequestOutcomeUnknown(request=request, instance_id=self._instance_id) from exc
             raise GoServiceUnavailable(request=request) from exc
-        data = _decode_json(response, request)
-        if response.status_code >= 400:
-            _raise_service_error(data, request)
-        if response.status_code != expected_status or "error" in data:
-            raise GoProtocolError("Go 服务返回了错误的状态或 envelope", request=request)
+        if self._instance_id is not None and response.headers.get(INSTANCE_HEADER) != self._instance_id:
+            if path.endswith("/requests"):
+                raise GoRequestOutcomeUnknown("控制响应实例不匹配", request=request, instance_id=self._instance_id)
+            raise GoProtocolError("控制响应实例不匹配", request=request)
+        try:
+            data = _decode_json(response, request)
+            if response.status_code >= 400:
+                _raise_service_error(data, request)
+            if response.status_code != expected_status or "error" in data:
+                raise GoProtocolError("Go 服务返回了错误的状态或 envelope", request=request)
+        except GoProtocolError as exc:
+            if self._instance_id is not None and path.endswith("/requests") and exc.code is None:
+                raise GoRequestOutcomeUnknown(request=request, instance_id=self._instance_id) from exc
+            raise
         return data
 
     def _create_session(self, request: httpx.Request | None = None) -> str:
@@ -489,6 +561,8 @@ class _GoTransport(httpx.BaseTransport):
             )
         except httpx.TransportError as exc:
             raise GoServiceUnavailable() from exc
+        if self._instance_id is not None and response.headers.get(INSTANCE_HEADER) != self._instance_id:
+            raise GoProtocolError("删除会话的控制响应实例不匹配")
         if response.status_code >= 400:
             _raise_service_error(_decode_json(response, None), None)
         if response.status_code != 204:
@@ -537,7 +611,7 @@ class _GoTransport(httpx.BaseTransport):
                     request,
                 )
             except GoProtocolError as exc:
-                if exc.code != "CLIENT_NOT_FOUND":
+                if exc.code != "CLIENT_NOT_FOUND" or self._instance_id is not None:
                     raise
                 client_id = self._rebuild(generation, request)
                 data = self._call(
@@ -546,7 +620,12 @@ class _GoTransport(httpx.BaseTransport):
                     payload,
                     request,
                 )
-            return self._response(data, request)
+            try:
+                return self._response(data, request)
+            except GoProtocolError as exc:
+                if self._instance_id is not None:
+                    raise GoRequestOutcomeUnknown(request=request, instance_id=self._instance_id) from exc
+                raise
         finally:
             with self._condition:
                 self._active -= 1
@@ -707,9 +786,12 @@ class _GoTransport(httpx.BaseTransport):
 
 
 class _AsyncGoTransport(httpx.AsyncBaseTransport):
-    def __init__(self, endpoint: str, token: str | None, options: ClientOptions) -> None:
+    def __init__(self, endpoint: str, token: str | None, options: ClientOptions, *, instance_id=None) -> None:
         self._endpoint = endpoint.rstrip("/")
-        self._headers = {"Authorization": f"Bearer {token}"} if token else None
+        self._instance_id = instance_id
+        self._headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if instance_id is not None:
+            self._headers[INSTANCE_HEADER] = instance_id
         self._options = options
         self._payload = _client_payload(options)
         self._control: httpx.AsyncClient | None = None
@@ -741,6 +823,11 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
         if request is not None and payload is not None and "timeout_ms" in payload:
             timeout_ms = payload["timeout_ms"] if payload is not None else 0
             control_timeout = (timeout_ms / 1000 if timeout_ms else _MAX_TARGET_TIMEOUT) + _TARGET_TIMEOUT_GRACE
+        if self._instance_id is not None and request is not None:
+            remaining = request.extensions.get("_gohttpx_deadline", time.monotonic() + control_timeout) - time.monotonic()
+            if remaining <= 0:
+                raise GoServiceUnavailable("等待恢复已用尽本次请求预算", request=request)
+            control_timeout = min(control_timeout, remaining)
         try:
             response = await self._control.request(
                 method,
@@ -749,12 +836,23 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
                 timeout=control_timeout,
             )
         except httpx.TransportError as exc:
+            if self._instance_id is not None and path.endswith("/requests") and not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+                raise GoRequestOutcomeUnknown(request=request, instance_id=self._instance_id) from exc
             raise GoServiceUnavailable(request=request) from exc
-        data = _decode_json(response, request)
-        if response.status_code >= 400:
-            _raise_service_error(data, request)
-        if response.status_code != expected_status or "error" in data:
-            raise GoProtocolError("Go 服务返回了错误的状态或 envelope", request=request)
+        if self._instance_id is not None and response.headers.get(INSTANCE_HEADER) != self._instance_id:
+            if path.endswith("/requests"):
+                raise GoRequestOutcomeUnknown("控制响应实例不匹配", request=request, instance_id=self._instance_id)
+            raise GoProtocolError("控制响应实例不匹配", request=request)
+        try:
+            data = _decode_json(response, request)
+            if response.status_code >= 400:
+                _raise_service_error(data, request)
+            if response.status_code != expected_status or "error" in data:
+                raise GoProtocolError("Go 服务返回了错误的状态或 envelope", request=request)
+        except GoProtocolError as exc:
+            if self._instance_id is not None and path.endswith("/requests") and exc.code is None:
+                raise GoRequestOutcomeUnknown(request=request, instance_id=self._instance_id) from exc
+            raise
         return data
 
     async def _delete_session(self, client_id: str) -> None:
@@ -767,6 +865,8 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
             )
         except httpx.TransportError as exc:
             raise GoServiceUnavailable() from exc
+        if self._instance_id is not None and response.headers.get(INSTANCE_HEADER) != self._instance_id:
+            raise GoProtocolError("删除会话的控制响应实例不匹配")
         if response.status_code >= 400:
             _raise_service_error(_decode_json(response, None), None)
         if response.status_code != 204:
@@ -872,7 +972,7 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
                     request,
                 )
             except GoProtocolError as exc:
-                if exc.code != "CLIENT_NOT_FOUND":
+                if exc.code != "CLIENT_NOT_FOUND" or self._instance_id is not None:
                     raise
                 client_id = await self._rebuild(generation, request)
                 data = await self._call(
@@ -881,7 +981,12 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
                     payload,
                     request,
                 )
-            return _GoTransport._response(data, request)
+            try:
+                return _GoTransport._response(data, request)
+            except GoProtocolError as exc:
+                if self._instance_id is not None:
+                    raise GoRequestOutcomeUnknown(request=request, instance_id=self._instance_id) from exc
+                raise
         finally:
             async with self._condition:
                 self._active -= 1
@@ -925,6 +1030,258 @@ class _AsyncGoTransport(httpx.AsyncBaseTransport):
                 self._condition.notify_all()
         if error is not None:
             raise error
+
+
+@dataclass(eq=False)
+class _ManagedEntry:
+    instance: Any
+    ready: Future = field(default_factory=Future)
+    users: int = 0
+
+
+class _ManagedState:
+    def __init__(self, options, factory):
+        with _runtime_lock:
+            self._runtime = _runtime
+            try:
+                self._runtime.acquire()
+            except RuntimeUnavailable as exc:
+                raise GoServiceUnavailable(str(exc)) from exc
+        self._options = options
+        self._factory = factory
+        self._condition = threading.Condition()
+        self._entries = {}
+        self._active = 0
+        self._closing = self._closed = False
+
+    def _checkout(self, instance):
+        with self._condition:
+            entry = self._entries.get(instance)
+            creator = entry is None
+            if creator:
+                entry = _ManagedEntry(instance)
+                self._entries[instance] = entry
+            entry.users += 1
+        if creator:
+            try:
+                entry.ready.set_result(self._factory(instance.endpoint, instance.token, self._options, instance_id=instance.instance_id))
+            except BaseException as exc:
+                entry.ready.set_exception(exc)
+        try:
+            entry.ready.result()
+            return entry
+        except BaseException:
+            with self._condition:
+                entry.users -= 1
+                if self._entries.get(instance) is entry:
+                    self._entries.pop(instance)
+            raise
+
+    def _release_entry(self, entry, invalidate=False):
+        with self._condition:
+            entry.users -= 1
+            if invalidate and self._entries.get(entry.instance) is entry:
+                self._entries.pop(entry.instance)
+            if entry.users == 0 and self._entries.get(entry.instance) is not entry:
+                return True
+            return False
+
+    def _prune(self, instance):
+        with self._condition:
+            unused = [entry for key, entry in self._entries.items() if key is not instance and entry.users == 0]
+            for entry in unused:
+                self._entries.pop(entry.instance)
+            return unused
+
+    def _begin(self, request):
+        budget = (_timeout_ms(request.extensions.get("timeout"), request) / 1000 or _MAX_TARGET_TIMEOUT) + _TARGET_TIMEOUT_GRACE
+        with self._condition:
+            if self._closing or self._closed:
+                raise GoServiceUnavailable("Go transport 已关闭", request=request)
+            self._active += 1
+        return time.monotonic() + budget
+
+    def _finish(self):
+        with self._condition:
+            self._active -= 1
+            self._condition.notify_all()
+
+
+class _ManagedGoTransport(_ManagedState, httpx.BaseTransport):
+    def __init__(self, options):
+        super().__init__(options, _GoTransport)
+        try:
+            entry = self._checkout(self._runtime.ensure())
+            self._release_entry(entry)
+        except BaseException as exc:
+            self.close()
+            if isinstance(exc, RuntimeUnavailable):
+                raise GoServiceUnavailable(str(exc)) from exc
+            raise
+
+    def _close_entry(self, entry):
+        transport = entry.ready.result()
+        if not self._runtime.is_current(entry.instance):
+            transport._client_id = None
+        try:
+            transport.close()
+        except httpx.HTTPError:
+            # 会话回收失败不能掩盖已经取得的业务结果；旧实例仍由运行时负责回收。
+            pass
+
+    def handle_request(self, request):
+        deadline = self._begin(request)
+        previous = request.extensions.get("_gohttpx_deadline", _UNSET)
+        request.extensions["_gohttpx_deadline"] = deadline
+        try:
+            request.read()
+            for attempt in range(2):
+                try:
+                    instance = self._runtime.ensure(max(0, deadline - time.monotonic()))
+                except RuntimeUnavailable as exc:
+                    raise GoServiceUnavailable(str(exc), request=request) from exc
+                for old in self._prune(instance):
+                    self._close_entry(old)
+                entry = None
+                invalidate = False
+                try:
+                    entry = self._checkout(instance)
+                    return entry.ready.result().handle_request(request)
+                except GoServiceUnavailable:
+                    self._runtime.report_fault(instance)
+                    if attempt:
+                        raise
+                except GoRequestOutcomeUnknown:
+                    self._runtime.report_fault(instance)
+                    raise
+                except GoProtocolError as exc:
+                    if exc.code == "CLIENT_NOT_FOUND" and not attempt:
+                        invalidate = True
+                    else:
+                        raise
+                finally:
+                    if entry is not None and self._release_entry(entry, invalidate):
+                        self._close_entry(entry)
+        finally:
+            if previous is _UNSET:
+                request.extensions.pop("_gohttpx_deadline", None)
+            else:
+                request.extensions["_gohttpx_deadline"] = previous
+            self._finish()
+
+    def close(self):
+        with self._condition:
+            if self._closed:
+                return
+            if self._closing:
+                while not self._closed:
+                    self._condition.wait()
+                return
+            self._closing = True
+            while self._active:
+                self._condition.wait()
+            entries = list(self._entries.values())
+            self._entries.clear()
+        try:
+            for entry in entries:
+                if entry.ready.done() and entry.ready.exception() is None:
+                    self._close_entry(entry)
+        finally:
+            self._runtime.release()
+            with self._condition:
+                self._closed = True
+                self._condition.notify_all()
+
+
+class _ManagedAsyncGoTransport(_ManagedState, httpx.AsyncBaseTransport):
+    def __init__(self, options):
+        super().__init__(options, _AsyncGoTransport)
+        self._cleanup = None
+        self._retiring = set()
+
+    async def _close_entry(self, entry):
+        transport = entry.ready.result()
+        if not self._runtime.is_current(entry.instance):
+            transport._client_id = None
+        task = asyncio.create_task(transport.aclose())
+        self._retiring.add(task)
+
+        def completed(done):
+            self._retiring.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(completed)
+        try:
+            # 一个业务请求取消时，已经退休的连接池仍必须完成关闭。
+            await asyncio.shield(task)
+        except httpx.HTTPError:
+            pass
+
+    async def handle_async_request(self, request):
+        deadline = self._begin(request)
+        previous = request.extensions.get("_gohttpx_deadline", _UNSET)
+        request.extensions["_gohttpx_deadline"] = deadline
+        try:
+            await request.aread()
+            for attempt in range(2):
+                try:
+                    instance = await self._runtime.ensure_async(max(0, deadline - time.monotonic()))
+                except RuntimeUnavailable as exc:
+                    raise GoServiceUnavailable(str(exc), request=request) from exc
+                for old in self._prune(instance):
+                    await self._close_entry(old)
+                entry = self._checkout(instance)
+                invalidate = False
+                try:
+                    return await entry.ready.result().handle_async_request(request)
+                except GoServiceUnavailable:
+                    self._runtime.report_fault(instance)
+                    if attempt:
+                        raise
+                except GoRequestOutcomeUnknown:
+                    self._runtime.report_fault(instance)
+                    raise
+                except GoProtocolError as exc:
+                    if exc.code == "CLIENT_NOT_FOUND" and not attempt:
+                        invalidate = True
+                    else:
+                        raise
+                finally:
+                    if self._release_entry(entry, invalidate):
+                        await self._close_entry(entry)
+        finally:
+            if previous is _UNSET:
+                request.extensions.pop("_gohttpx_deadline", None)
+            else:
+                request.extensions["_gohttpx_deadline"] = previous
+            self._finish()
+
+    async def _run_close(self):
+        with self._condition:
+            self._closing = True
+        while True:
+            with self._condition:
+                if not self._active:
+                    entries = list(self._entries.values())
+                    self._entries.clear()
+                    break
+            await asyncio.sleep(0.01)
+        try:
+            for entry in entries:
+                await self._close_entry(entry)
+            if self._retiring:
+                await asyncio.gather(*self._retiring, return_exceptions=True)
+        finally:
+            self._runtime.release()
+            with self._condition:
+                self._closed = True
+                self._condition.notify_all()
+
+    async def aclose(self):
+        if self._cleanup is None:
+            self._cleanup = asyncio.create_task(self._run_close())
+        await asyncio.shield(self._cleanup)
 
 
 def _resolve_client_options(
@@ -1000,7 +1357,7 @@ class Client(httpx.Client):
     def __init__(
         self,
         *,
-        go_endpoint: str = "http://127.0.0.1:9876",
+        go_endpoint: str | None = None,
         go_token: str | None = None,
         client_options: ClientOptions | None = None,
         tls_fingerprint: TLSFingerprint | str | None = None,
@@ -1038,11 +1395,12 @@ class Client(httpx.Client):
             http2,
         )
 
-        go_transport = _GoTransport(
-            go_endpoint,
-            os.getenv("GOHTTPX_TOKEN") if go_token is None else go_token,
-            options,
-        )
+        if go_endpoint is None:
+            if go_token is not None:
+                raise RuntimeConfigurationError("managed 模式不需要 go_token；连接外部服务请显式指定 go_endpoint")
+            go_transport = _ManagedGoTransport(options)
+        else:
+            go_transport = _GoTransport(go_endpoint, os.getenv("GOHTTPX_TOKEN") if go_token is None else go_token, options)
         try:
             super().__init__(
                 auth=auth,
@@ -1074,7 +1432,7 @@ class AsyncClient(httpx.AsyncClient):
     def __init__(
         self,
         *,
-        go_endpoint: str = "http://127.0.0.1:9876",
+        go_endpoint: str | None = None,
         go_token: str | None = None,
         client_options: ClientOptions | None = None,
         tls_fingerprint: TLSFingerprint | str | None = None,
@@ -1111,24 +1469,32 @@ class AsyncClient(httpx.AsyncClient):
             http1,
             http2,
         )
-        go_transport = _AsyncGoTransport(
-            go_endpoint,
-            os.getenv("GOHTTPX_TOKEN") if go_token is None else go_token,
-            options,
-        )
-        super().__init__(
-            auth=auth,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            timeout=timeout,
-            follow_redirects=follow_redirects,
-            max_redirects=max_redirects,
-            event_hooks=event_hooks,
-            base_url=base_url,
-            transport=go_transport,
-            default_encoding=default_encoding,
-        )
+        if go_endpoint is None:
+            if go_token is not None:
+                raise RuntimeConfigurationError("managed 模式不需要 go_token；连接外部服务请显式指定 go_endpoint")
+            go_transport = _ManagedAsyncGoTransport(options)
+        else:
+            go_transport = _AsyncGoTransport(go_endpoint, os.getenv("GOHTTPX_TOKEN") if go_token is None else go_token, options)
+        try:
+            super().__init__(
+                auth=auth,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                timeout=timeout,
+                follow_redirects=follow_redirects,
+                max_redirects=max_redirects,
+                event_hooks=event_hooks,
+                base_url=base_url,
+                transport=go_transport,
+                default_encoding=default_encoding,
+            )
+        except BaseException:
+            # AsyncClient 构造期间尚未创建 Go 会话或异步控制连接，可以同步释放引用。
+            if isinstance(go_transport, _ManagedAsyncGoTransport):
+                go_transport._runtime.release()
+                go_transport._closed = True
+            raise
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
 
@@ -1148,6 +1514,14 @@ __all__ = [
     "ClientOptions",
     "GoProtocolError",
     "GoServiceUnavailable",
+    "GoRequestOutcomeUnknown",
+    "RuntimeConfigurationError",
+    "configure_runtime",
+    "start",
+    "astart",
+    "shutdown",
+    "ashutdown",
+    "runtime_status",
     "HTTP2Options",
     "HTTP2Setting",
     "Impersonate",

@@ -25,6 +25,7 @@ type cliOptions struct {
 	maxBodyMiB       int64
 	idleTTL          time.Duration
 	version          bool
+	managed          bool
 }
 
 func exitError(value any) {
@@ -43,7 +44,20 @@ func parseCLI(args []string, environmentToken string) (cliOptions, error) {
 	flags.Int64Var(&options.maxBodyMiB, "max-body-mib", 48, "最大目标请求与响应正文（MiB）")
 	flags.DurationVar(&options.idleTTL, "idle-ttl", 24*time.Hour, "空闲会话生存时间")
 	flags.BoolVar(&options.version, "version", false, "输出版本信息")
-	return options, flags.Parse(args)
+	flags.BoolVar(&options.managed, "managed", false, "由 Python 私有管道托管")
+	if err := flags.Parse(args); err != nil {
+		return options, err
+	}
+	var conflict bool
+	flags.Visit(func(f *flag.Flag) {
+		if options.managed && (f.Name == "host" || f.Name == "port" || f.Name == "token" || f.Name == "insecure-no-auth" || f.Name == "allow-non-loopback") {
+			conflict = true
+		}
+	})
+	if conflict {
+		return options, errors.New("managed 模式不接受外部地址、端口或鉴权参数")
+	}
+	return options, nil
 }
 
 func main() {
@@ -71,6 +85,12 @@ func main() {
 	}
 	if options.idleTTL <= 0 {
 		exitError("--idle-ttl 必须大于 0")
+	}
+	if options.managed {
+		if err := runManaged(options, os.Stdin, os.Stdout); err != nil {
+			exitError(err)
+		}
+		return
 	}
 	if options.insecureNoAuth {
 		options.token = ""
