@@ -1,5 +1,15 @@
 # 更新记录
 
+## 2.1.0（2026-08-28）
+
+- Python `Client`、`AsyncClient`、`ClientOptions` 新增 `tls_spec`，接受 JSON 对象/字符串；Go 严格校验并使用自定义 uTLS ClientHello，不回退内置指纹。
+- 沿用 uTLS JSON 字段，支持顺序控制、签名算法、曲线/KeyShare、ALPN/ALPS、GREASE 和常用扩展；不支持的字段明确报错。
+- 每连接独立 spec 和动态密钥，保留 mTLS、代理和自动 HTTP/2；Python 保存配置快照，session 重建/Go 崩溃后恢复不变。
+- 增加独立网络字节解析的 TLS 抓包用例、Edge 模板 TLS 1.2/1.3 验证、并发/Cookie 隔离和安装包实际握手验证。
+- GitHub 首页内联全部 TLS 顶层字段与扩展参数示例，显式配置 User-Agent，并说明 ALPS 互斥替换；测试直接执行 README，独立演示 JSON 不纳入提交或构建包。
+- SDK/EXE 同步为 2.1.0，控制协议仍为 v1；版本必须一致。现有版本断言仅随版本号更新，原有行为断言不放宽。
+- GitHub 首页增加使用免责声明：仅授权接口测试，禁止违法用途。
+
 ## 2.0.0
 
 - 默认 `Client()` / `AsyncClient()` 自动托管 Go；每个 Python 进程一份 Go，多 client 独立 session/Cookie。

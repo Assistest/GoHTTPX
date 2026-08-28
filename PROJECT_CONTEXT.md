@@ -1,6 +1,6 @@
 # GoHTTPX 项目上下文与开发规范
 
-> 文档状态：GoHTTPX 2.0 项目规范，业务控制协议仍为 v1。后续开发开始前必须先阅读本文。
+> 文档状态：GoHTTPX 2.1 项目规范，业务控制协议仍为 v1。后续开发开始前必须先阅读本文。
 >
 > 适用范围：当前 GoHTTPX 独立仓库根目录。
 
@@ -220,6 +220,17 @@ req 原生 fingerprint handshake 不会自动携带客户端证书，因此 GoHT
 - 兼容 HTTP CONNECT proxy。
 - 不接受调用方自定义 callback。
 - 不允许失败后静默降级为普通 TLS。
+
+### 8.1.1 自定义 TLS JSON
+
+2.1 增加 `tls_spec`（Python JSON 对象或字符串，Go 接收对象），沿用 uTLS JSON 字段，并明确限制扩展支持范围。详情见 `docs/tls-json.md`。
+
+- 配置属于 Client/session，Python 在构造时保存不可变快照，恢复时重发同一配置。
+- 原始 JSON 声明可以保存，uTLS 扩展对象和 KeyShare 不得跨连接共享；每次握手重新解析并 `HelloCustom + ApplyPreset`。
+- 不把 `SetTLSFingerprintSpec` 的共享 spec 指针直接用于并发连接；固定内部握手同时保留 mTLS、SNI、verify 与代理路径。
+- TLS JSON 配置/示例变更必须检查服务端实际收到的 ClientHello（套件、扩展内容和顺序），只检查 DTO、JA3/JA4 或 HTTP 200 不足以验收。
+- 公共 TLS 演示内联在 README 的 `tls-demo` 代码块，测试直接解析并执行该代码块；不依赖另行下载的 JSON。最小差异配置作为内部夹具保存在 `testdata/tls/`，本地旧 `examples/tls/*.json` 不提交或打包。新增模板必须补可发现用例并记录协议/动态字段边界。
+- 2.1 不开放 PSK/ticket 注入、TLS 1.3 恢复配置、任意原始扩展或回调；未知/忽略字段必须拒绝。
 
 ### 8.2 HTTP/3 例外
 
@@ -485,8 +496,8 @@ gohttpx-server.exe --version
 
 ## 18. 当前固定版本
 
-- GoHTTPX server：`2.0.0`
-- Python SDK：`2.0.0`
+- GoHTTPX server：`2.1.0`
+- Python SDK：`2.1.0`
 - protocol：`1`
 - Python：`>=3.10`
 - HTTPX：`>=0.28,<0.29`

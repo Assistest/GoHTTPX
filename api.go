@@ -40,7 +40,7 @@ const (
 	retryBackoff         = "backoff"
 )
 
-var serverVersion = "2.0.0"
+var serverVersion = "2.1.0"
 
 func versionLine() string {
 	versions := map[string]string{}
@@ -145,6 +145,7 @@ type createClientRequest struct {
 	ProtocolVersion int             `json:"protocol_version"`
 	SDKVersion      string          `json:"sdk_version"`
 	TLSFingerprint  string          `json:"tls_fingerprint,omitempty"`
+	TLSSpec         *tlsSpec        `json:"tls_spec,omitempty"`
 	Impersonate     string          `json:"impersonate,omitempty"`
 	ProxyURL        string          `json:"proxy_url,omitempty"`
 	Verify          *bool           `json:"verify,omitempty"`
@@ -550,7 +551,7 @@ func (s *server) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 	if input.Impersonate == "" {
 		input.Impersonate = "none"
 	}
-	if input.TLSFingerprint == "" && input.Impersonate == "none" && input.HTTPVersion != "http2" {
+	if input.TLSSpec == nil && input.TLSFingerprint == "" && input.Impersonate == "none" && input.HTTPVersion != "http2" {
 		input.TLSFingerprint = "android_11_okhttp"
 	}
 	client, err := buildReqClient(input)
@@ -1020,7 +1021,9 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 		client.SetCerts(certificate)
 	}
 
-	if input.HTTPVersion != "http3" {
+	if input.TLSSpec != nil {
+		setUTLSHandshake(client, utls.HelloCustom, input.TLSSpec)
+	} else if input.HTTPVersion != "http3" {
 		var clientHelloID utls.ClientHelloID
 		switch input.Impersonate {
 		case "chrome":
@@ -1043,7 +1046,7 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 			}
 		}
 		if input.ClientCertPEM != "" && input.HTTPVersion != "http2" {
-			setClientCertificateTLSHandshake(client, clientHelloID)
+			setUTLSHandshake(client, clientHelloID, nil)
 		}
 	}
 	if input.ProxyURL != "" {
@@ -1183,11 +1186,11 @@ func buildReqClient(input createClientRequest) (*req.Client, error) {
 	return client, nil
 }
 
-type clientCertificateUTLSConn struct {
+type utlsConn struct {
 	*utls.UConn
 }
 
-func (conn *clientCertificateUTLSConn) ConnectionState() tls.ConnectionState {
+func (conn *utlsConn) ConnectionState() tls.ConnectionState {
 	state := conn.Conn.ConnectionState()
 	return tls.ConnectionState{
 		Version:                     state.Version,
@@ -1205,7 +1208,8 @@ func (conn *clientCertificateUTLSConn) ConnectionState() tls.ConnectionState {
 	}
 }
 
-func setClientCertificateTLSHandshake(client *req.Client, clientHelloID utls.ClientHelloID) {
+func setUTLSHandshake(client *req.Client, clientHelloID utls.ClientHelloID, custom *tlsSpec) {
+	// req 的 Spec 接口复用指针且不携带客户端证书；这里同时保留 mTLS 和每连接独立配置。
 	client.SetTLSHandshake(func(ctx context.Context, addr string, plainConn net.Conn) (net.Conn, *tls.ConnectionState, error) {
 		tlsConfig := client.GetTLSClientConfig()
 		serverName := tlsConfig.ServerName
@@ -1249,13 +1253,25 @@ func setClientCertificateTLSHandshake(client *req.Client, clientHelloID utls.Cli
 			KeyLogWriter:                tlsConfig.KeyLogWriter,
 			VerifyPeerCertificate:       tlsConfig.VerifyPeerCertificate,
 		}
-		config.GetClientCertificate = func(request *utls.CertificateRequestInfo) (*utls.Certificate, error) {
-			if err := request.SupportsCertificate(&certificates[0]); err != nil {
-				return nil, fmt.Errorf("configured client certificate is incompatible: %w", err)
+		if len(certificates) > 0 {
+			config.GetClientCertificate = func(request *utls.CertificateRequestInfo) (*utls.Certificate, error) {
+				if err := request.SupportsCertificate(&certificates[0]); err != nil {
+					return nil, fmt.Errorf("configured client certificate is incompatible: %w", err)
+				}
+				return &certificates[0], nil
 			}
-			return &certificates[0], nil
 		}
-		connection := &clientCertificateUTLSConn{utls.UClient(plainConn, config, clientHelloID)}
+		connection := &utlsConn{utls.UClient(plainConn, config, clientHelloID)}
+		if custom != nil {
+			// 每个连接重新构造扩展及 KeyShare，避免复用前一次握手的可变数据。
+			spec, err := custom.clientHelloSpec()
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := connection.ApplyPreset(spec); err != nil {
+				return nil, nil, err
+			}
+		}
 		if err := connection.HandshakeContext(ctx); err != nil {
 			return nil, nil, err
 		}
@@ -1269,6 +1285,29 @@ func toHTTP2Priority(input priorityParam) http2.PriorityParam {
 }
 
 func validateClientConfig(input createClientRequest) error {
+	if input.TLSSpec != nil {
+		if input.tlsFingerprintSet || input.TLSFingerprint != "" || input.Impersonate != "" && input.Impersonate != "none" {
+			return errors.New("tls_spec, tls_fingerprint and impersonate are mutually exclusive")
+		}
+		if input.HTTPVersion == "http2" || input.HTTPVersion == "http3" || input.HTTPVersion == "h2c" {
+			return errors.New("tls_spec requires auto or http1; forced HTTP/2, HTTP/3 and H2C are unsupported")
+		}
+		spec, err := input.TLSSpec.clientHelloSpec()
+		if err != nil {
+			return err
+		}
+		if input.HTTPVersion == "http1" {
+			for _, extension := range spec.Extensions {
+				if alpn, ok := extension.(*utls.ALPNExtension); ok {
+					for _, protocol := range alpn.AlpnProtocols {
+						if protocol != "http/1.1" {
+							return errors.New("forced HTTP/1 conflicts with tls_spec ALPN")
+						}
+					}
+				}
+			}
+		}
+	}
 	impersonate := input.Impersonate
 	if impersonate == "" {
 		impersonate = "none"

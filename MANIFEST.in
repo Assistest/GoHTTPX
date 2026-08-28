@@ -2,6 +2,7 @@ include *.go go.mod go.sum
 include CHANGELOG.md RUNBOOK.md PROJECT_CONTEXT.md
 recursive-include docs *.md
 recursive-include python *.py
-recursive-include testdata *.go go.mod go.sum
+recursive-include testdata *.go go.mod go.sum *.json
 recursive-include tools *.py
+prune examples
 exclude python/_gohttpx_bin/*.exe

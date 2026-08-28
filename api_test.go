@@ -102,7 +102,7 @@ func TestVersionFlagNeedsNoTokenAndReportsFixedBuildVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--version failed: %v\n%s", err, output)
 	}
-	want := "GoHTTPX server 2.0.0 protocol 1 req/v3 v3.59.0 uTLS v1.8.2\n"
+	want := "GoHTTPX server 2.1.0 protocol 1 req/v3 v3.59.0 uTLS v1.8.2\n"
 	if string(output) != want {
 		t.Fatalf("--version output = %q, want %q", output, want)
 	}
@@ -1807,6 +1807,190 @@ func TestCreateClientRejectsIgnoredRetryField(t *testing.T) {
 	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", strings.NewReader(`{"protocol_version":1,"sdk_version":"`+serverVersion+`","retry":{"count":1,"mode":"fixed","fixed_interval_ms":1,"backoff_min_ms":1}}`)))
 	if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" || !strings.Contains(response.Body.String(), "retry.backoff_min_ms") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCustomTLSJSONCreatesSession(t *testing.T) {
+	spec, err := os.ReadFile("testdata/tls/custom_tls13.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]any{"protocol_version": protocolVersion, "sdk_version": serverVersion, "tls_spec": json.RawMessage(spec)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer("", 48<<20, time.Hour)
+	defer s.Close()
+	response := httptest.NewRecorder()
+	s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", bytes.NewReader(body)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d response=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCustomTLSRejectsIgnoredInvalidAndConflictingConfiguration(t *testing.T) {
+	raw, err := os.ReadFile("testdata/tls/custom_tls13.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		change func(map[string]any)
+	}{
+		{"unknown top field", func(s map[string]any) { s["fake"] = true }},
+		{"case insensitive top field", func(s map[string]any) { s["Cipher_Suites"] = s["cipher_suites"]; delete(s, "cipher_suites") }},
+		{"empty suites", func(s map[string]any) { s["cipher_suites"] = []string{} }},
+		{"duplicate suites", func(s map[string]any) { s["cipher_suites"] = []string{"TLS_AES_128_GCM_SHA256", "0x1301"} }},
+		{"duplicate GREASE aliases", func(s map[string]any) { s["cipher_suites"] = []string{"0x1a1a", "0x2a2a", "0x1301"} }},
+		{"unknown suites", func(s map[string]any) { s["cipher_suites"] = []string{"unknown"} }},
+		{"missing compression", func(s map[string]any) { delete(s, "compression_methods") }},
+		{"null extension", func(s map[string]any) { s["extensions"].([]any)[2] = nil }},
+		{"unknown extension", func(s map[string]any) { s["extensions"].([]any)[2] = map[string]any{"name": "pre_shared_key"} }},
+		{"ignored extension field", func(s map[string]any) { s["extensions"].([]any)[2].(map[string]any)["unknown"] = 1 }},
+		{"missing extension field", func(s map[string]any) {
+			delete(s["extensions"].([]any)[2].(map[string]any), "supported_signature_algorithms")
+		}},
+		{"duplicate extension", func(s map[string]any) { s["extensions"].([]any)[2] = s["extensions"].([]any)[1] }},
+		{"static key", func(s map[string]any) {
+			s["extensions"].([]any)[5].(map[string]any)["client_shares"].([]any)[1].(map[string]any)["key_exchange"] = []int{1, 2}
+		}},
+		{"key field typo", func(s map[string]any) {
+			s["extensions"].([]any)[5].(map[string]any)["client_shares"].([]any)[1].(map[string]any)["unknown"] = 1
+		}},
+		{"key group missing", func(s map[string]any) {
+			s["extensions"].([]any)[5].(map[string]any)["client_shares"].([]any)[1].(map[string]any)["group"] = "secp384r1"
+		}},
+		{"non HTTP ALPN", func(s map[string]any) {
+			s["extensions"].([]any)[6].(map[string]any)["protocol_name_list"] = []string{"h3"}
+		}},
+		{"version conflict", func(s map[string]any) { s["min_vers"] = 771 }},
+		{"wrong bool type", func(s map[string]any) { s["shuffle_extensions"] = "false" }},
+		{"wrong integer type", func(s map[string]any) { s["min_vers"] = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var spec map[string]any
+			if err := json.Unmarshal(raw, &spec); err != nil {
+				t.Fatal(err)
+			}
+			test.change(spec)
+			body, err := json.Marshal(map[string]any{"protocol_version": protocolVersion, "sdk_version": serverVersion, "tls_spec": spec})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := newServer("", 48<<20, time.Hour)
+			defer s.Close()
+			response := httptest.NewRecorder()
+			s.routes().ServeHTTP(response, newJSONControlRequest("/api/v1/clients", bytes.NewReader(body)))
+			if response.Code != http.StatusBadRequest || decodeAPIError(t, response).Code != "INVALID_REQUEST" {
+				t.Fatalf("unexpected response: %s", response.Body.String())
+			}
+		})
+	}
+	for _, data := range []string{
+		strings.Replace(string(raw), `"extensions":`, `"extensions":[],"extensions":`, 1),
+		strings.Replace(string(raw), `"name": "server_name"`, `"name":"GREASE","name":"server_name"`, 1),
+		string(raw) + `{}`,
+		`{"cipher_suites":["` + strings.Repeat("x", maxTLSSpecBytes) + `"]}`,
+	} {
+		var spec tlsSpec
+		if err := json.Unmarshal([]byte(data), &spec); err == nil {
+			t.Fatal("invalid JSON was accepted")
+		}
+	}
+	var spec tlsSpec
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	for _, config := range []createClientRequest{
+		{TLSSpec: &spec, TLSFingerprint: "golang"}, {TLSSpec: &spec, tlsFingerprintSet: true},
+		{TLSSpec: &spec, Impersonate: "chrome"}, {TLSSpec: &spec, HTTPVersion: "http2"},
+		{TLSSpec: &spec, HTTPVersion: "http3"}, {TLSSpec: &spec, HTTPVersion: "h2c"},
+	} {
+		if _, err := buildReqClient(config); err == nil {
+			t.Fatalf("conflicting TLS config accepted: %#v", config)
+		}
+	}
+}
+
+func TestCustomTLSGREASEAliasesNormalizeBeforeDeduplication(t *testing.T) {
+	for _, alias := range []string{"GREASE", "0x0a0a", "0x1a1a", "0xfafa"} {
+		ids, err := tlsIDs([]string{alias, "0x1301"}, nil)
+		if err != nil || !reflect.DeepEqual(ids, []uint16{0x0a0a, 0x1301}) {
+			t.Fatalf("alias=%s ids=%x err=%v", alias, ids, err)
+		}
+		if _, err := tlsIDs([]string{alias, "0x0a0a"}, nil); err == nil {
+			t.Fatalf("duplicate GREASE accepted: %s", alias)
+		}
+	}
+	shares, err := parseTLSKeyShares([]byte(`[{"group":"0x1a1a","key_exchange":[0]},{"group":"x25519"}]`))
+	if err != nil || len(shares.KeyShares) != 2 || shares.KeyShares[0].Group != 0x0a0a {
+		t.Fatalf("shares=%v err=%v", shares, err)
+	}
+	if _, err := parseTLSKeyShares([]byte(`[{"group":"0x1a1a"},{"group":"0x2a2a"}]`)); err == nil {
+		t.Fatal("duplicate GREASE key shares accepted")
+	}
+}
+
+func TestCustomTLSConcurrentHandshakesUseIndependentSpecs(t *testing.T) {
+	raw, err := os.ReadFile("testdata/tls/custom_tls13.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec tlsSpec
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	one, err := spec.clientHelloSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := spec.clientHelloSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range one.Extensions {
+		if one.Extensions[i] == two.Extensions[i] {
+			t.Fatal("TLS extension shared across connections")
+		}
+	}
+	var handshakes atomic.Int32
+	target := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "custom TLS") }))
+	target.TLS = &tls.Config{GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+		if !reflect.DeepEqual(info.CipherSuites[1:], []uint16{0x1302, 0x1303, 0x1301}) {
+			t.Errorf("wire cipher suites=%x", info.CipherSuites)
+		}
+		if !reflect.DeepEqual(info.SignatureSchemes, []tls.SignatureScheme{0x0805, 0x0403, 0x0804}) {
+			t.Errorf("wire signature schemes=%x", info.SignatureSchemes)
+		}
+		handshakes.Add(1)
+		return nil, nil
+	}}
+	target.StartTLS()
+	defer target.Close()
+	verify, keepAlive := false, false
+	client, err := buildReqClient(createClientRequest{TLSSpec: &spec, Verify: &verify, KeepAlive: &keepAlive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.GetClient().CloseIdleConnections()
+	var wg sync.WaitGroup
+	for range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			response, err := client.R().Get(target.URL)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if response.StatusCode != http.StatusOK {
+				t.Errorf("status=%d", response.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	if handshakes.Load() != 12 {
+		t.Fatalf("handshakes=%d", handshakes.Load())
 	}
 }
 

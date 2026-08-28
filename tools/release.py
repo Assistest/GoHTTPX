@@ -64,10 +64,13 @@ def write_release_notes(version):
     (directory / "SHA256SUMS").write_text("".join(f"{digest}  {name}\n" for name, _, digest in rows), encoding="ascii")
     notes = [
         f"# GoHTTPX {version}", "",
+        "## 免责声明", "",
+        "本项目仅用于你有权访问的接口测试、自动化回归、协议兼容性验证和本地开发。禁止未授权访问、绕过安全控制、干扰他人系统及任何违法用途。使用者自行承担全部法律责任。", "",
         "## 安装", "",
         "Windows amd64、Python 3.10+；wheel 已内置匹配版本的 Go EXE，无需单独下载、安装 Go 编译器或手动启动服务。", "",
         "```powershell", f'python -m pip install --upgrade --only-binary=gohttpx "gohttpx=={version}"', "```", "",
         "## 主要变化", "",
+        "- 新增 `tls_spec`：自定义 uTLS ClientHello JSON；与内置指纹、impersonate 互斥，校验失败不回退默认指纹。",
         "- 每个 Python 进程自动托管一份 Go，动态端口；不同 client 的 session 和 Cookie 隔离。",
         "- Python 结束后通过 Windows Job 回收 Go；Go 崩溃后自动恢复，结果不确定的在途请求不会被自动重放。",
         "- 外部服务模式需显式 go_endpoint；单独传 go_token 不再选择旧固定端口。不能只复制 gohttpx.py，Linux/macOS 托管尚不支持。",

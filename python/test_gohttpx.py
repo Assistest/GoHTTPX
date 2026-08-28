@@ -169,7 +169,7 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             200,
             {
                 "protocol_version": 1,
-                "server_version": "2.0.0",
+                "server_version": "2.1.0",
                 "max_body_bytes": 48 << 20,
                 "tls_fingerprints": FINGERPRINTS,
             },
@@ -338,7 +338,7 @@ class ClientTests(unittest.TestCase):
         self.thread.join()
 
     def test_enum_matches_go_capabilities_and_default_create_contract(self):
-        self.assertEqual(__version__, "2.0.0")
+        self.assertEqual(__version__, "2.1.0")
         self.assertEqual({item.value for item in TLSFingerprint}, set(FINGERPRINTS))
         self.assertEqual(len(TLSFingerprint), 49)
         client = Client(go_endpoint=self.endpoint, go_token="secret")
@@ -424,6 +424,54 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(create["retry"]["status_codes"], [503])
         self.assertEqual(create["transport"]["proxy_connect_headers"], {"X-Proxy": ["a", "b"]})
         self.assertEqual(create["http2"]["priority_frames"][0]["priority"]["weight"], 7)
+
+    def test_client_options_preserves_existing_positional_arguments(self):
+        options = ClientOptions("chrome_120", "none", "http://proxy.test:8080", False)
+        self.assertEqual(options.tls_fingerprint, "chrome_120")
+        self.assertEqual(options.impersonate, "none")
+        self.assertEqual(options.proxy_url, "http://proxy.test:8080")
+        self.assertFalse(options.verify)
+        self.assertIsNone(options.tls_spec)
+
+    def test_tls_spec_dict_and_json_string_are_sent_as_objects_without_default_fingerprint(self):
+        original = json.loads((Path(__file__).resolve().parents[1] / "testdata/tls/custom_tls13.json").read_text(encoding="utf-8"))
+        for value in (original, json.dumps(original)):
+            with Client(go_endpoint=self.endpoint, tls_spec=value):
+                pass
+        with Client(go_endpoint=self.endpoint, client_options=ClientOptions(tls_spec=original)):
+            pass
+        creates = [call["payload"] for call in self.state.calls if call["path"] == "/api/v1/clients"]
+        self.assertEqual(len(creates), 3)
+        for create in creates:
+            self.assertEqual(create["tls_spec"], original)
+            self.assertNotIn("tls_fingerprint", create)
+
+    def test_tls_spec_snapshot_is_unchanged_after_mutation_and_sync_session_rebuild(self):
+        original = json.loads((Path(__file__).resolve().parents[1] / "testdata/tls/custom_tls13.json").read_text(encoding="utf-8"))
+        expected = json.loads(json.dumps(original))
+        self.state.not_found_remaining = 1
+        with Client(go_endpoint=self.endpoint, tls_spec=original) as client:
+            original["cipher_suites"].reverse()
+            self.assertEqual(client.get("https://target.test/echo").status_code, 200)
+        creates = [call["payload"] for call in self.state.calls if call["path"] == "/api/v1/clients"]
+        self.assertEqual(len(creates), 2)
+        self.assertEqual(creates[0]["tls_spec"], expected)
+        self.assertEqual(creates[1], creates[0])
+
+    def test_tls_spec_rejects_bad_json_and_conflicts_before_starting_control_io(self):
+        valid = {"cipher_suites": ["TLS_AES_128_GCM_SHA256"], "compression_methods": ["NULL"], "extensions": []}
+        for value in ([], "[]", "null", "{}", "{", json.dumps(valid) + "{}", {**valid, "unexpected": 1},
+                      {**valid, "extensions": [None]}, {**valid, "min_vers": float("nan")},
+                      {**valid, "extensions": [{1: "bad"}]}, json.dumps(valid).replace('"extensions": []', '"extensions": [], "extensions": []'),
+                      {**valid, "cipher_suites": ["x" * 65536]}):
+            with self.subTest(value=str(value)[:80]):
+                for client_type in (Client, AsyncClient):
+                    with self.assertRaises((ValueError, TypeError)):
+                        client_type(go_endpoint=self.endpoint, tls_spec=value)
+        for extra in ({"tls_fingerprint": "golang"}, {"impersonate": "chrome"}):
+            with self.assertRaises(ValueError):
+                Client(go_endpoint=self.endpoint, tls_spec=valid, **extra)
+        self.assertEqual(self.state.calls, [])
 
     def test_http3_default_omits_fingerprint_and_unsupported_transport_defaults(self):
         self.state.enforce_http3_create = True
@@ -710,7 +758,7 @@ class ClientTests(unittest.TestCase):
     def test_capabilities_require_exact_valid_compatible_fields(self):
         valid = {
             "protocol_version": 1,
-            "server_version": "2.0.0",
+            "server_version": "2.1.0",
             "max_body_bytes": 48 << 20,
             "tls_fingerprints": FINGERPRINTS,
         }

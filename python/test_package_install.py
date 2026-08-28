@@ -4,12 +4,15 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 
 from gohttpx import __version__
+from e2e_support import TransportTarget
+from tls_test_support import TLSCaptureTarget
 
 
 class PackageInstallTests(unittest.TestCase):
@@ -21,6 +24,17 @@ class PackageInstallTests(unittest.TestCase):
             wheels = list((root / "dist").glob(f"gohttpx-{__version__}-*.whl"))
         self.assertEqual(len(wheels), 1, "expected one built wheel")
         return wheels[0]
+
+    def test_sdist_contains_readme_demo_and_test_fixture_but_no_local_json_examples(self):
+        root = Path(__file__).resolve().parents[1]
+        with tarfile.open(root / "dist" / f"gohttpx-{__version__}.tar.gz", "r:gz") as archive:
+            prefix = f"gohttpx-{__version__}/"
+            names = archive.getnames()
+            self.assertIn(prefix + "testdata/tls/custom_tls13.json", names)
+            self.assertFalse(any(name.startswith(prefix + "examples/") for name in names))
+            readme = archive.extractfile(prefix + "README.md").read().decode("utf-8").replace("\r\n", "\n")
+            self.assertEqual(readme, (root / "README.md").read_text(encoding="utf-8"))
+            self.assertIn("<!-- tls-demo:start -->", readme)
 
     def test_wheel_metadata_declares_package_requirements(self):
         with zipfile.ZipFile(self.get_wheel()) as wheel:
@@ -65,6 +79,18 @@ class PackageInstallTests(unittest.TestCase):
             self.assertTrue(Path(state["module"]).is_relative_to(environment))
             handle = kernel.OpenProcess(0x00100000, False, state["child_pid"])
             self.assertTrue(handle)
+            certificates = TransportTarget(root)
+            try:
+                with TLSCaptureTarget(certificates) as target:
+                    spec = json.loads((root / "testdata/tls/custom_tls13.json").read_text(encoding="utf-8"))
+                    process.stdin.write(json.dumps({"tls_spec": spec, "ca_path": str(certificates.ca_path), "url": target.endpoint}) + "\n")
+                    process.stdin.flush()
+                    observed = json.loads(process.stdout.readline())
+                    self.assertEqual(observed["hello"]["cipher_suites"][1:], [0x1302, 0x1303, 0x1301])
+                    self.assertEqual([ext["id"] for ext in observed["hello"]["extensions"]][1:-1], [0, 13, 43, 10, 51, 16, 27])
+                    self.assertEqual(next(ext["data"] for ext in observed["hello"]["extensions"] if ext["id"] == 13), "0006080504030804")
+            finally:
+                certificates.close()
             _, error = process.communicate("exit\n", timeout=10)
             self.assertEqual(process.returncode, 0, error)
             self.assertEqual(kernel.WaitForSingleObject(handle, 5000), 0, "installed worker left Go alive")

@@ -19,7 +19,7 @@ import httpx
 
 from _gohttpx_runtime import INSTANCE_HEADER, ManagedRuntime, RuntimeConfigurationError, RuntimeUnavailable
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 _runtime = ManagedRuntime(__version__)
 _runtime_lock = threading.RLock()
 
@@ -195,6 +195,7 @@ class ClientOptions:
     retry: RetryOptions = field(default_factory=RetryOptions)
     transport: TransportOptions = field(default_factory=TransportOptions)
     http2: HTTP2Options = field(default_factory=HTTP2Options)
+    tls_spec: Mapping[str, Any] | str | None = None
 
 
 @dataclass(frozen=True)
@@ -389,17 +390,61 @@ def _retarget_transport_error(error: BaseException, request: httpx.Request) -> B
     return error
 
 
+def _normalize_tls_spec(value: Mapping[str, Any] | str) -> str:
+    def reject_duplicate(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"tls_spec 包含重复字段: {key}")
+            result[key] = item
+        return result
+
+    if isinstance(value, str):
+        if len(value.encode("utf-8")) > 65536:
+            raise ValueError("tls_spec 不能超过 65536 字节")
+        value = json.loads(value, object_pairs_hook=reject_duplicate)
+    elif isinstance(value, Mapping):
+        value = dict(value)
+    else:
+        raise TypeError("tls_spec 必须是 JSON 对象或 JSON 字符串")
+    if not isinstance(value, dict):
+        raise TypeError("tls_spec 必须是 JSON 对象")
+    required = {"cipher_suites", "compression_methods", "extensions"}
+    if not required.issubset(value) or set(value) - required - {"min_vers", "max_vers", "shuffle_extensions"}:
+        raise ValueError("tls_spec 包含缺失或未知字段")
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > 8:
+            raise ValueError("tls_spec 嵌套不能超过 8 层")
+        if isinstance(item, dict):
+            if not all(isinstance(key, str) for key in item):
+                raise TypeError("tls_spec 的字段名必须是字符串")
+            pending.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+        elif type(item) not in (str, int, bool):
+            raise TypeError("tls_spec 不接受 null、浮点数或非 JSON 类型")
+    encoded = json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    if len(encoded) > 65536:
+        raise ValueError("tls_spec 不能超过 65536 字节")
+    # 保存不可变快照，避免调用方修改 dict 后影响后续的会话重建。
+    return encoded
+
+
 def _client_payload(options: ClientOptions) -> dict[str, Any]:
     payload = _wire(options)
     payload["protocol_version"] = 1
     payload["sdk_version"] = __version__
+    if options.tls_spec is not None:
+        payload["tls_spec"] = json.loads(_normalize_tls_spec(options.tls_spec))
     impersonate = payload.get("impersonate", "none")
     if payload.get("http_version") == "http3":
         defaults = TransportOptions()
         for name in ("expect_continue_timeout_ms", "max_idle_conns"):
             if getattr(options.transport, name) == getattr(defaults, name):
                 payload["transport"][name] = 0
-    if "tls_fingerprint" not in payload and impersonate == "none" and payload.get("http_version") not in ("http2", "http3"):
+    if "tls_spec" not in payload and "tls_fingerprint" not in payload and impersonate == "none" and payload.get("http_version") not in ("http2", "http3"):
         payload["tls_fingerprint"] = TLSFingerprint.ANDROID_11_OKHTTP.value
     return payload
 
@@ -1287,6 +1332,7 @@ class _ManagedAsyncGoTransport(_ManagedState, httpx.AsyncBaseTransport):
 def _resolve_client_options(
     client_options: ClientOptions | None,
     tls_fingerprint: TLSFingerprint | str | None,
+    tls_spec: Mapping[str, Any] | str | None,
     impersonate: Impersonate | str | None,
     verify: bool | str | os.PathLike[str] | ssl.SSLContext | object,
     cert: str | os.PathLike[str] | tuple[str | os.PathLike[str], str | os.PathLike[str]] | object,
@@ -1299,6 +1345,8 @@ def _resolve_client_options(
     options = client_options or ClientOptions()
     if tls_fingerprint is not None:
         options = replace(options, tls_fingerprint=tls_fingerprint)
+    if tls_spec is not None:
+        options = replace(options, tls_spec=tls_spec)
     if impersonate is not None:
         options = replace(options, impersonate=impersonate)
 
@@ -1350,6 +1398,10 @@ def _resolve_client_options(
             raise ValueError("http1/http2 至少启用一个")
         version = "auto" if supports_http1 and supports_http2 else "http1" if supports_http1 else "http2"
         options = replace(options, http_version=version)
+    if options.tls_spec is not None:
+        if options.tls_fingerprint is not None or options.impersonate not in ("none", Impersonate.NONE):
+            raise ValueError("tls_spec、tls_fingerprint、impersonate 不能同时使用")
+        options = replace(options, tls_spec=_normalize_tls_spec(options.tls_spec))
     return options
 
 
@@ -1361,6 +1413,7 @@ class Client(httpx.Client):
         go_token: str | None = None,
         client_options: ClientOptions | None = None,
         tls_fingerprint: TLSFingerprint | str | None = None,
+        tls_spec: Mapping[str, Any] | str | None = None,
         impersonate: Impersonate | str | None = None,
         verify: bool | str | os.PathLike[str] | ssl.SSLContext | object = _UNSET,
         cert: str | os.PathLike[str] | tuple[str | os.PathLike[str], str | os.PathLike[str]] | object = _UNSET,
@@ -1387,6 +1440,7 @@ class Client(httpx.Client):
         options = _resolve_client_options(
             client_options,
             tls_fingerprint,
+            tls_spec,
             impersonate,
             verify,
             cert,
@@ -1436,6 +1490,7 @@ class AsyncClient(httpx.AsyncClient):
         go_token: str | None = None,
         client_options: ClientOptions | None = None,
         tls_fingerprint: TLSFingerprint | str | None = None,
+        tls_spec: Mapping[str, Any] | str | None = None,
         impersonate: Impersonate | str | None = None,
         verify: bool | str | os.PathLike[str] | ssl.SSLContext | object = _UNSET,
         cert: str | os.PathLike[str] | tuple[str | os.PathLike[str], str | os.PathLike[str]] | object = _UNSET,
@@ -1462,6 +1517,7 @@ class AsyncClient(httpx.AsyncClient):
         options = _resolve_client_options(
             client_options,
             tls_fingerprint,
+            tls_spec,
             impersonate,
             verify,
             cert,

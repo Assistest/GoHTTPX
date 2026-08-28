@@ -1,10 +1,20 @@
-# GoHTTPX 2.0
+# GoHTTPX 2.1
 
 GoHTTPX 保留 HTTPX 的请求编码、Cookie、认证、重定向和 Response 语义，由本地 Go 执行 TLS 指纹、代理及 HTTP/1/2/3 请求。
 
 **2.0 默认自动托管 Go：每个 Python 进程一份 Go，多个 client 共用进程，但各自拥有独立 session 和 Cookie。** 不需要手动启动服务，不需要配置端口或请求密钥。
 
-当前版本为 `2.0.0`，控制协议仍为 `/api/v1`、`protocol_version=1`。发布产物见 [PyPI](https://pypi.org/project/gohttpx/) 和 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases)。
+当前源码版本为 `2.1.0`，新增自定义 TLS JSON；控制协议仍为 `/api/v1`、`protocol_version=1`，Python 和 Go 必须同版本。公开发布产物见 [PyPI](https://pypi.org/project/gohttpx/) 和 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases)；开发者也可使用下方本地 wheel。
+
+## 免责声明
+
+GoHTTPX 是 HTTP 客户端，**只用于你有权访问的接口测试、自动化回归、协议兼容性验证和本地开发**。
+
+本项目不是攻击、绕过或入侵工具。禁止用于未授权访问、绕过安全控制、干扰或破坏他人系统，以及任何违法用途。你必须自行取得目标站点/接口的合法授权，并对自己的使用行为承担全部法律责任。作者和贡献者不对滥用、违规或违法使用承担任何责任。
+
+软件按 [MIT License](LICENSE) 提供，不附带适销性或特定用途适用性保证。
+
+**Disclaimer.** GoHTTPX is an HTTP client for authorized API testing, automated regression, protocol compatibility checks, and local development only. It is not an attack, bypass, or intrusion tool. Unauthorized access, circumvention of security controls, interference with others' systems, and any illegal use are prohibited. You are solely responsible for obtaining lawful authorization and for how you use this software. The authors and contributors accept no liability for misuse. The software is provided under the MIT License, without warranty.
 
 ## 安装与最小用法
 
@@ -13,7 +23,7 @@ GoHTTPX 保留 HTTPX 的请求编码、Cookie、认证、重定向和 Response �
 从 PyPI 安装，Go EXE 随 wheel 一起安装，无需另行下载：
 
 ```powershell
-python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.0.0"
+python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.0"
 ```
 
 `--only-binary=gohttpx` 避免在不支持的平台意外回退到源码编译；本版本不提供 Linux/macOS 托管安装包。
@@ -23,7 +33,7 @@ python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.0.0"
 ```powershell
 python -m pip install build
 python -m build
-python -m pip install dist\gohttpx-2.0.0-py3-none-win_amd64.whl
+python -m pip install --upgrade dist\gohttpx-2.1.0-py3-none-win_amd64.whl
 ```
 
 wheel 内置匹配版本的 Go EXE。部署机器安装 wheel 后不需要 Go 编译器；第一次请求不下载、不编译任何程序。2.0 不再支持只复制一个 `gohttpx.py` 即完成接入。
@@ -128,7 +138,7 @@ with Client(go_endpoint="http://127.0.0.1:9876", go_token="your-secret") as clie
 
 `json/data/files/content`、params、headers、cookies、Basic/Digest auth、redirect/history 仍由 HTTPX 准备和处理；Go 接收最终 bytes。`client_options=ClientOptions(...)` 设置独立 session 的传输配置，单次选项放在 `extensions={"go_req": RequestOptions(...)}`。
 
-支持 `tls_fingerprint`、`impersonate`、`verify`、`cert`、`proxy`、`http1`、`http2` 等固定会话便利参数。不接受 `transport`、`mounts`，不提供 `limits` 或目标 `trust_env` 的便利映射；固定代理和连接池请用下面的 DTO。控制连接始终 `trust_env=False`。
+支持 `tls_fingerprint`、`tls_spec`、`impersonate`、`verify`、`cert`、`proxy`、`http1`、`http2` 等固定会话便利参数。不接受 `transport`、`mounts`，不提供 `limits` 或目标 `trust_env` 的便利映射；固定代理和连接池请用下面的 DTO。控制连接始终 `trust_env=False`。
 
 ## TLS、代理、证书和 HTTP 版本
 
@@ -176,6 +186,138 @@ for client in (http1, http2, http3, h2c):
 - HTTP/3 请求的非空 `header_order`、`pseudo_header_order`，以及 `force_chunked=true`、`close_connection=true` 会返回 `INVALID_REQUEST`。
 - `keep_alive=false` 会在每次 HTTP/3 响应完整读取后关闭空闲 QUIC 连接；`true` 允许复用。
 
+<a id="custom-tls-json"></a>
+
+### 自定义 TLS JSON（2.1.0 起）
+
+**整段复制即可运行，不需要下载 JSON 文件，也不要求在仓库目录运行。** 先安装 2.1.0 的完整 wheel。
+
+此示例把当前开放的 **6 个 TLS 顶层字段全部写出**，以此前的 Edge 151 模板为基础，展开扩展参数。它是一组可运行的配置，不是“已实现浏览器全部功能”的承诺。旧、新 ALPS 互斥，替换方式见代码后。
+
+`tls_spec` 只影响 TLS；`User-Agent` 属于 HTTP 请求头，必须单独配置。下方 UA 是示例字符串，使用时应替换为你的目标客户端实际值。
+
+<!-- tls-demo:start -->
+```python
+import json
+
+from gohttpx import Client
+
+
+TLS_SPEC_JSON = r"""
+{
+  "min_vers": 771,
+  "max_vers": 772,
+  "shuffle_extensions": false,
+  "cipher_suites": [
+    "GREASE",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_RSA_WITH_AES_256_CBC_SHA"
+  ],
+  "compression_methods": ["NULL"],
+  "extensions": [
+    {"name": "GREASE"},
+    {
+      "name": "application_layer_protocol_negotiation",
+      "protocol_name_list": ["h2", "http/1.1"]
+    },
+    {
+      "name": "key_share",
+      "client_shares": [
+        {"group": "GREASE", "key_exchange": [0]},
+        {"group": "X25519MLKEM768"},
+        {"group": "x25519"}
+      ]
+    },
+    {"name": "session_ticket"},
+    {
+      "name": "supported_groups",
+      "named_group_list": ["GREASE", "X25519MLKEM768", "x25519", "secp256r1", "secp384r1"]
+    },
+    {"name": "status_request"},
+    {"name": "extended_master_secret"},
+    {"name": "encrypted_client_hello"},
+    {"name": "ec_point_formats", "ec_point_format_list": ["uncompressed"]},
+    {"name": "supported_versions", "versions": ["GREASE", "TLS 1.3", "TLS 1.2"]},
+    {"name": "renegotiation_info"},
+    {"name": "server_name"},
+    {"name": "compress_certificate", "algorithms": ["brotli"]},
+    {"name": "signed_certificate_timestamp"},
+    {
+      "name": "signature_algorithms",
+      "supported_signature_algorithms": [
+        "0x0904", "0x0905", "0x0906",
+        "ecdsa_secp256r1_sha256", "rsa_pss_rsae_sha256", "rsa_pkcs1_sha256",
+        "ecdsa_secp384r1_sha384", "rsa_pss_rsae_sha384", "rsa_pkcs1_sha384",
+        "rsa_pss_rsae_sha512", "rsa_pkcs1_sha512"
+      ]
+    },
+    {"name": "psk_key_exchange_modes", "ke_modes": ["psk_dhe_ke"]},
+    {"name": "application_settings_new", "supported_protocols": ["h2"]},
+    {"name": "GREASE"}
+  ]
+}
+"""
+TLS_SPEC = json.loads(TLS_SPEC_JSON)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0"
+    ),
+    "Accept": "application/json",
+}
+
+# 保留默认 auto，由 ALPN 协商 HTTP/1.1 或 HTTP/2；证书校验保持开启。
+with Client(tls_spec=TLS_SPEC, headers=HEADERS, timeout=20) as client:
+    response = client.get("https://tls.peet.ws/api/all")
+    response.raise_for_status()
+    print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+```
+<!-- tls-demo:end -->
+
+也可以直接 `Client(tls_spec=TLS_SPEC_JSON, headers=HEADERS)`，SDK 同样接受 JSON 字符串。`AsyncClient` 使用相同参数。关闭 Client 会释放自己的 session，所属 Python 的 Go 服务仍按托管生命周期复用和回收。
+
+#### 全部顶层字段与可选值
+
+| 字段 | 可配置范围 |
+|---|---|
+| `cipher_suites` | 必填，1–128 项；uTLS/IANA 名称、`GREASE` 或 `"0x1301"` 形式的字符串，顺序保留，不允许重复编号 |
+| `compression_methods` | 必填，当前仅支持 `["NULL"]`，不是 HTTP 的 Accept-Encoding |
+| `extensions` | 必填，1–64 个扩展对象；扩展类型及其参数如上，旧 ALPS 见下方替换示例 |
+| `min_vers` | 可省略或 0；显式 771=TLS 1.2、772=TLS 1.3，须与 `supported_versions` 的最低版本一致 |
+| `max_vers` | 可省略或 0；显式 771/772，须与 `supported_versions` 的最高版本一致 |
+| `shuffle_extensions` | 可省略，默认 false；true 在新连接中打乱可洗牌扩展，保留 GREASE 等受保护位置 |
+
+**不能把所有可选值同时放进一份配置。** 例如上面的新版 ALPS 为 17613；需要旧版 17513 时，把那一项替换为下面的对象，不能追加两个：
+
+```json
+{"name": "application_settings", "supported_protocols": ["h2"]}
+```
+
+同样，证书压缩的 `algorithms` 可选 `brotli`、`zlib`；真实 KeyShare 组支持 `x25519`、`secp256r1`、`secp384r1`、`secp521r1`、`X25519MLKEM768`，且必须列在 `supported_groups`。真实组的密钥由库生成，只有 GREASE 可以填写占位 `key_exchange: [0]`。
+
+`server_name` 的值来自目标 URL，不填写固定域名；random、session ID、真实 KeyShare 不接受固定值。`encrypted_client_hello` 当前仅表示 GREASE ECH，占位扩展不是实际 ECH 加密配置。算法编号可以声明，但不意味着 uTLS 实现了该算法；例如示例中的 `0x0904/0x0905/0x0906` 只验证了发送，未承诺与仅接受这些算法的服务器握手。
+
+字段沿用 uTLS JSON 命名，不接受 `type/alpn/groups` 等简写或任意新增 key。完整扩展字段表、长度限制及边界见 [TLS JSON 配置](docs/tls-json.md)。这段 README 本身是固定测试的数据源：测试执行示例并检查实际 ClientHello，不另外发布需要用户下载的演示 JSON 文件。
+
+配置在创建 Python Client 时保存快照，修改原字典不会改变已有 Client，也不会改变 Go 重启后的恢复配置。每次 TLS 握手重新生成 uTLS 扩展对象和密钥，禁止跨连接共享可变 spec。HTTP/2 SETTINGS、伪头和普通 headers 仍由原来的独立选项配置。
+
+`tls_spec` 只支持 `http_version="auto"` 或兼容 ALPN 的 `http1`。需要 HTTP/2 时在 JSON 的 ALPN 中声明 `h2`，保留默认 `auto`，不要强制 `http2`。HTTP/3、H2C、未知扩展、无效字段、重复 JSON key、静态 KeyShare 和不兼容组合明确拒绝；没有失败后退回 Go 默认指纹的路径。
+
 ### TLSFingerprint 全部 49 个值
 
 | 家族 | 值 |
@@ -190,7 +332,7 @@ for client in (http1, http2, http3, h2c):
 | 360 | `360_auto`, `360_7_5`, `360_11_0` |
 | QQ | `qq_auto`, `qq_11_1` |
 
-`ClientOptions.tls_fingerprint` 的 Python 默认是 `None`；当 HTTP 版本为 `auto/http1/h2c` 且 impersonate 为 `none` 时，SDK 的有效默认是 `android_11_okhttp`。强制 HTTPS HTTP/2 与 HTTP/3 使用标准 TLS。
+`ClientOptions.tls_fingerprint` 的 Python 默认是 `None`；未提供 `tls_spec`、HTTP 版本为 `auto/http1/h2c` 且 impersonate 为 `none` 时，SDK 的有效默认是 `android_11_okhttp`。强制 HTTPS HTTP/2 与 HTTP/3 使用标准 TLS。
 
 ## 完整 DTO 字段矩阵
 
@@ -198,9 +340,11 @@ for client in (http1, http2, http3, h2c):
 
 ### ClientOptions
 
+新增 `tls_spec: Mapping[str, Any] | str | None = None`：自定义 TLS JSON；与显式预设和 impersonate 互斥，详见上节。
+
 | 字段 | Python 类型 | 默认 | 含义、边界与 HTTP/3 规则 |
 |---|---|---:|---|
-| `tls_fingerprint` | `TLSFingerprint | str | None` | `None` | `auto/http1/h2c` 且无 impersonate 时有效默认 `android_11_okhttp`；强制 HTTPS HTTP/2、HTTP/3 必须省略。 |
+| `tls_fingerprint` | `TLSFingerprint | str | None` | `None` | 未提供 tls_spec、`auto/http1/h2c` 且无 impersonate 时有效默认 `android_11_okhttp`；强制 HTTPS HTTP/2、HTTP/3 必须省略。 |
 | `impersonate` | `Impersonate | str` | `none` | `none/chrome/firefox/safari`；非 `none` 与显式 fingerprint 互斥，强制 HTTPS HTTP/2、HTTP/3 拒绝。 |
 | `proxy_url` | `str | None` | `None` | 固定 `http/https/socks5/socks5h` URL；不能与强制 HTTP/2、HTTP/3、H2C 组合。 |
 | `verify` | `bool` | `True` | 是否校验证书；HTTP/3 生效。 |
@@ -337,6 +481,7 @@ v1 JSON 在任何层级都禁止 `null`，每个对象拒绝未知 key。创建�
 
 ## 限制与安全边界
 
+- 仅授权接口测试；禁止违法使用。完整条款见 [免责声明](#免责声明)。
 - 请求和响应均完整缓冲在内存中；默认每方向 48 MiB，可用 `--max-body-mib` 调整。
 - v1 不支持 streaming upload/download、WebSocket、SSE 或 parallel download。
 - 控制配置 JSON 上限 4 MiB；目标 URL 最长 16384 bytes，method 最长 64 bytes。
@@ -351,7 +496,7 @@ v1 JSON 在任何层级都禁止 `null`，每个对象拒绝未知 key。创建�
 
 默认托管模式按前文随所属 Python 自动管理；外部模式由部署方管理。升级时安装匹配版本的完整 wheel，或同时更新 SDK 和外部 EXE。Go session 在 client 关闭时删除；遗留空闲 session 默认 24 小时回收，活动请求不会被空闲清理。
 
-2.0 的生命周期变化没有给业务 v1 JSON 增加字段。后续修改 required/optional key、字段类型或语义，仍须同时修改双方并通过兼容性测试。
+2.0 的生命周期变化没有给业务 v1 JSON 增加字段。2.1 同步升级两端，向创建会话请求增加可选 `tls_spec`，旧 2.0 SDK/EXE 会因版本不一致明确拒绝。后续修改 required/optional key、字段类型或语义，仍须同时修改双方并通过兼容性测试。
 
 ## 测试与离线 E2E
 

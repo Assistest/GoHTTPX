@@ -1,0 +1,20 @@
+{
+  "cipher_suites": [
+    "GREASE",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_AES_128_GCM_SHA256"
+  ],
+  "compression_methods": ["NULL"],
+  "extensions": [
+    {"name": "GREASE"},
+    {"name": "server_name"},
+    {"name": "signature_algorithms", "supported_signature_algorithms": ["rsa_pss_rsae_sha384", "ecdsa_secp256r1_sha256", "rsa_pss_rsae_sha256"]},
+    {"name": "supported_versions", "versions": ["GREASE", "TLS 1.3"]},
+    {"name": "supported_groups", "named_group_list": ["GREASE", "secp256r1", "x25519"]},
+    {"name": "key_share", "client_shares": [{"group": "GREASE", "key_exchange": [0]}, {"group": "x25519"}]},
+    {"name": "application_layer_protocol_negotiation", "protocol_name_list": ["http/1.1"]},
+    {"name": "compress_certificate", "algorithms": ["brotli"]},
+    {"name": "GREASE"}
+  ]
+}

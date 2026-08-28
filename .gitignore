@@ -11,3 +11,5 @@ dist/
 .tmp/
 build/
 python/_gohttpx_bin/*.exe
+# 首页内联演示配置，本地旧示例不纳入提交。
+/examples/tls/*.json

@@ -41,7 +41,13 @@ if __name__ == "__main__":
         state = gohttpx.runtime_status()
         assert state["start_count"] == 1 and state["active_clients"] == 0
         print(json.dumps({**state, "module": gohttpx.__file__, "version": gohttpx.__version__}), flush=True)
-        sys.stdin.readline()
+        for line in sys.stdin:
+            if line.strip() == "exit":
+                break
+            command = json.loads(line)
+            with gohttpx.Client(tls_spec=command["tls_spec"], verify=command["ca_path"]) as client:
+                observed = client.get(command["url"]).json()
+            print(json.dumps(observed), flush=True)
     finally:
         target.shutdown()
         target.server_close()
