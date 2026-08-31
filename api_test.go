@@ -102,7 +102,7 @@ func TestVersionFlagNeedsNoTokenAndReportsFixedBuildVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--version failed: %v\n%s", err, output)
 	}
-	want := "GoHTTPX server 2.1.1 protocol 1 req/v3 v3.59.0 uTLS v1.8.2\n"
+	want := "GoHTTPX server 2.1.2 protocol 1 req/v3 v3.59.0 uTLS v1.8.2\n"
 	if string(output) != want {
 		t.Fatalf("--version output = %q, want %q", output, want)
 	}
@@ -1928,6 +1928,61 @@ func TestCustomTLSGREASEAliasesNormalizeBeforeDeduplication(t *testing.T) {
 	}
 	if _, err := parseTLSKeyShares([]byte(`[{"group":"0x1a1a"},{"group":"0x2a2a"}]`)); err == nil {
 		t.Fatal("duplicate GREASE key shares accepted")
+	}
+}
+
+func TestCustomTLSModernBrowserExtensionsSerializeDeclaredBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want []byte
+	}{
+		{"delegated credentials", `{"name":"delegated_credentials","supported_signature_algorithms":["ecdsa_secp256r1_sha256","ecdsa_secp384r1_sha384","0x0603"]}`,
+			[]byte{0x00, 0x22, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03}},
+		{"record size limit", `{"name":"record_size_limit","record_size_limit":16385}`,
+			[]byte{0x00, 0x1c, 0x00, 0x02, 0x40, 0x01}},
+		{"certificate compression", `{"name":"compress_certificate","algorithms":["zlib","brotli","zstd"]}`,
+			[]byte{0x00, 0x1b, 0x00, 0x07, 0x06, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, extension, err := parseTLSExtension([]byte(test.json))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire := make([]byte, extension.Len())
+			if _, err := extension.Read(wire); err != nil && !errors.Is(err, io.EOF) {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(wire, test.want) {
+				t.Fatalf("wire=%x want=%x", wire, test.want)
+			}
+		})
+	}
+	_, extension, err := parseTLSExtension([]byte(`{"name":"encrypted_client_hello","candidate_cipher_suites":[{"kdf_id":1,"aead_id":3}],"candidate_config_ids":[145],"candidate_payload_lens":[223]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := make([]byte, extension.Len())
+	if _, err := extension.Read(wire); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if len(wire) != 285 || !bytes.Equal(wire[:9], []byte{0xfe, 0x0d, 0x01, 0x19, 0x00, 0x00, 0x01, 0x00, 0x03}) ||
+		wire[9] != 145 || !bytes.Equal(wire[10:12], []byte{0x00, 0x20}) || !bytes.Equal(wire[44:46], []byte{0x00, 0xef}) {
+		t.Fatalf("unexpected ECH wire shape: len=%d wire=%x", len(wire), wire)
+	}
+
+	for _, invalid := range []string{
+		`{"name":"record_size_limit","record_size_limit":63}`,
+		`{"name":"record_size_limit","record_size_limit":16386}`,
+		`{"name":"encrypted_client_hello","candidate_cipher_suites":[]}`,
+		`{"name":"encrypted_client_hello","candidate_cipher_suites":[{"kdf_id":1,"aead_id":4}]}`,
+		`{"name":"encrypted_client_hello","candidate_payload_lens":[0]}`,
+		`{"name":"encrypted_client_hello","candidate_config_ids":[1,1]}`,
+	} {
+		if _, _, err := parseTLSExtension([]byte(invalid)); err == nil {
+			t.Fatalf("invalid extension accepted: %s", invalid)
+		}
 	}
 }
 

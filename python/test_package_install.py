@@ -83,12 +83,23 @@ class PackageInstallTests(unittest.TestCase):
             try:
                 with TLSCaptureTarget(certificates) as target:
                     spec = json.loads((root / "testdata/tls/custom_tls13.json").read_text(encoding="utf-8"))
+                    spec["extensions"][7]["algorithms"] = ["zlib", "brotli", "zstd"]
+                    spec["extensions"][-1:-1] = [
+                        {"name": "delegated_credentials", "supported_signature_algorithms": ["ecdsa_secp256r1_sha256", "0x0603"]},
+                        {"name": "record_size_limit", "record_size_limit": 16385},
+                        {"name": "encrypted_client_hello", "candidate_cipher_suites": [{"kdf_id": 1, "aead_id": 3}], "candidate_payload_lens": [223]},
+                    ]
                     process.stdin.write(json.dumps({"tls_spec": spec, "ca_path": str(certificates.ca_path), "url": target.endpoint}) + "\n")
                     process.stdin.flush()
                     observed = json.loads(process.stdout.readline())
                     self.assertEqual(observed["hello"]["cipher_suites"][1:], [0x1302, 0x1303, 0x1301])
-                    self.assertEqual([ext["id"] for ext in observed["hello"]["extensions"]][1:-1], [0, 13, 43, 10, 51, 16, 27])
+                    self.assertEqual([ext["id"] for ext in observed["hello"]["extensions"]][1:-1], [0, 13, 43, 10, 51, 16, 27, 34, 28, 65037])
                     self.assertEqual(next(ext["data"] for ext in observed["hello"]["extensions"] if ext["id"] == 13), "0006080504030804")
+                    extensions = {ext["id"]: bytes.fromhex(ext["data"]) for ext in observed["hello"]["extensions"]}
+                    self.assertEqual(extensions[34], b"\x00\x04\x04\x03\x06\x03")
+                    self.assertEqual(extensions[28], b"\x40\x01")
+                    self.assertEqual(extensions[27], b"\x06\x00\x01\x00\x02\x00\x03")
+                    self.assertEqual(extensions[65037][:5], b"\x00\x00\x01\x00\x03")
             finally:
                 certificates.close()
             _, error = process.communicate("exit\n", timeout=10)
@@ -130,8 +141,8 @@ class PackageInstallTests(unittest.TestCase):
                     [
                         interpreter,
                         "-c",
-                        "from gohttpx import AsyncClient, Client, GoServiceUnavailable, RequestOptions; "
-                        "assert all((Client, AsyncClient, RequestOptions)); "
+                        "from gohttpx import AsyncClient, Client, GoServiceUnavailable, RequestOptions, tls_spec_from_client_hello; "
+                        "assert all((Client, AsyncClient, RequestOptions, tls_spec_from_client_hello)); "
                         f"\ntry: Client(go_endpoint='{endpoint}') "
                         "\nexcept GoServiceUnavailable as exc: assert 'https://github.com/Assistest/GoHTTPX' in str(exc) "
                         "\nelse: raise AssertionError('expected unavailable bridge')",

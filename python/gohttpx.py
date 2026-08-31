@@ -19,7 +19,7 @@ import httpx
 
 from _gohttpx_runtime import INSTANCE_HEADER, ManagedRuntime, RuntimeConfigurationError, RuntimeUnavailable
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 _runtime = ManagedRuntime(__version__)
 _runtime_lock = threading.RLock()
 
@@ -406,7 +406,7 @@ _TLS_SIGNATURES = {
     0x0401: "rsa_pkcs1_sha256", 0x0501: "rsa_pkcs1_sha384", 0x0601: "rsa_pkcs1_sha512",
 }
 _TLS_VERSIONS = {0x0303: "TLS 1.2", 0x0304: "TLS 1.3"}
-_TLS_CERT_COMPRESSION = {1: "zlib", 2: "brotli"}
+_TLS_CERT_COMPRESSION = {1: "zlib", 2: "brotli", 3: "zstd"}
 
 
 def _is_grease_id(value: int) -> bool:
@@ -533,6 +533,24 @@ def _parse_key_shares(data: bytes) -> list[dict[str, str]]:
     return shares
 
 
+def _parse_grease_ech(data: bytes) -> dict[str, Any]:
+    if len(data) < 10 or data[0] != 0:
+        raise ValueError("仅支持 outer GREASE ECH")
+    kdf_id = int.from_bytes(data[1:3], "big")
+    aead_id = int.from_bytes(data[3:5], "big")
+    if kdf_id not in (1, 2, 3) or aead_id not in (1, 2, 3):
+        raise ValueError(f"不支持的 ECH KDF/AEAD {kdf_id}/{aead_id}")
+    encapsulated_key, offset = _take_vector(data, 6, 2)
+    payload, offset = _take_vector(data, offset, 2)
+    if offset != len(data) or len(encapsulated_key) != 32 or len(payload) <= 16:
+        raise ValueError("ECH key/payload 长度无法由当前 tls_spec 表达")
+    return {
+        "name": "encrypted_client_hello",
+        "candidate_cipher_suites": [{"kdf_id": kdf_id, "aead_id": aead_id}],
+        "candidate_payload_lens": [len(payload) - 16],
+    }
+
+
 def _parse_hello_extension(kind: int, data: bytes) -> dict[str, Any]:
     if _is_grease_id(kind):
         return {"name": "GREASE"}
@@ -566,6 +584,18 @@ def _parse_hello_extension(kind: int, data: bytes) -> dict[str, Any]:
                 raise ValueError(f"不支持的证书压缩 {item}")
             algorithms.append(name)
         return {"name": "compress_certificate", "algorithms": algorithms}
+    if kind == 28:
+        if len(data) != 2:
+            raise ValueError("record_size_limit 长度无效")
+        limit = int.from_bytes(data, "big")
+        if not 64 <= limit <= 16385:
+            raise ValueError(f"record_size_limit 超出范围: {limit}")
+        return {"name": "record_size_limit", "record_size_limit": limit}
+    if kind == 34:
+        algorithms = _uint16_list(data, 2)
+        if not algorithms:
+            raise ValueError("delegated_credentials 算法列表为空")
+        return {"name": "delegated_credentials", "supported_signature_algorithms": [_tls_name(item, _TLS_SIGNATURES) for item in algorithms]}
     if kind == 35:
         return {"name": "session_ticket"}
     if kind == 43:
@@ -587,7 +617,7 @@ def _parse_hello_extension(kind: int, data: bytes) -> dict[str, Any]:
     if kind == 17613:
         return {"name": "application_settings_new", "supported_protocols": _protocol_list(data)}
     if kind == 65037:
-        return {"name": "encrypted_client_hello"}
+        return _parse_grease_ech(data)
     if kind == 65281:
         return {"name": "renegotiation_info"}
     raise ValueError(f"不支持的 TLS 扩展 {kind}")
@@ -1842,4 +1872,5 @@ __all__ = [
     "RetryOptions",
     "TLSFingerprint",
     "TransportOptions",
+    "tls_spec_from_client_hello",
 ]

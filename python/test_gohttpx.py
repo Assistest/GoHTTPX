@@ -104,7 +104,7 @@ def _wireshark_dump(data: bytes) -> str:
     return "\n".join(lines)
 
 
-def _sample_client_hello(extra: bytes = b""):
+def _sample_client_hello(extra: bytes = b"", compression: bytes = b"\x02\x00\x02"):
     ciphers = b"\x0a\x0a\x13\x02\x13\x03\x13\x01"
     sni = _tls_vector(b"\x00" + _tls_vector(b"localhost", 2), 2)
     versions = bytes([4]) + b"\x0a\x0a\x03\x04"
@@ -120,7 +120,7 @@ def _sample_client_hello(extra: bytes = b""):
         _tls_extension(10, groups),
         _tls_extension(51, shares),
         _tls_extension(16, alpn),
-        _tls_extension(27, b"\x02\x00\x02"),
+        _tls_extension(27, compression),
         extra,
         _tls_extension(0x1A1A, b""),
     ))
@@ -230,7 +230,7 @@ class FakeGoHandler(BaseHTTPRequestHandler):
             200,
             {
                 "protocol_version": 1,
-                "server_version": "2.1.1",
+                "server_version": "2.1.2",
                 "max_body_bytes": 48 << 20,
                 "tls_fingerprints": FINGERPRINTS,
             },
@@ -399,7 +399,8 @@ class ClientTests(unittest.TestCase):
         self.thread.join()
 
     def test_enum_matches_go_capabilities_and_default_create_contract(self):
-        self.assertEqual(__version__, "2.1.1")
+        self.assertEqual(__version__, "2.1.2")
+        self.assertIn("tls_spec_from_client_hello", gohttpx.__all__)
         self.assertEqual({item.value for item in TLSFingerprint}, set(FINGERPRINTS))
         self.assertEqual(len(TLSFingerprint), 49)
         client = Client(go_endpoint=self.endpoint, go_token="secret")
@@ -561,6 +562,28 @@ class ClientTests(unittest.TestCase):
         creates = [call["payload"] for call in self.state.calls if call["path"] == "/api/v1/clients"]
         self.assertEqual(creates[-1]["tls_spec"], expected)
         self.assertNotIn("tls_fingerprint", creates[-1])
+
+    def test_tls_spec_from_browser_hello_preserves_supported_modern_extensions(self):
+        delegated = _tls_extension(34, b"\x00\x06\x04\x03\x05\x03\x06\x03")
+        record_limit = _tls_extension(28, b"\x40\x01")
+        ech = _tls_extension(65037, b"\x00\x00\x01\x00\x03\x91\x00\x20" + b"\x22" * 32 + b"\x00\xef" + b"\x33" * 239)
+        record, _ = _sample_client_hello(delegated + record_limit + ech, b"\x06\x00\x01\x00\x02\x00\x03")
+        spec = tls_spec_from_client_hello(record)
+        extensions = {item["name"]: item for item in spec["extensions"]}
+        self.assertEqual(extensions["delegated_credentials"]["supported_signature_algorithms"],
+                         ["ecdsa_secp256r1_sha256", "ecdsa_secp384r1_sha384", "0x0603"])
+        self.assertEqual(extensions["record_size_limit"]["record_size_limit"], 16385)
+        self.assertEqual(extensions["compress_certificate"]["algorithms"], ["zlib", "brotli", "zstd"])
+        self.assertEqual(extensions["encrypted_client_hello"], {
+            "name": "encrypted_client_hello",
+            "candidate_cipher_suites": [{"kdf_id": 1, "aead_id": 3}],
+            "candidate_payload_lens": [223],
+        })
+
+        for invalid in (_tls_extension(28, b"\x00\x3f"), _tls_extension(34, b"\x00\x00"),
+                        _tls_extension(65037, b"\x01" + b"\x00" * 20)):
+            with self.subTest(invalid=invalid[:2].hex()), self.assertRaises(ValueError):
+                tls_spec_from_client_hello(_sample_client_hello(invalid)[0])
 
     def test_http3_default_omits_fingerprint_and_unsupported_transport_defaults(self):
         self.state.enforce_http3_create = True
@@ -847,7 +870,7 @@ class ClientTests(unittest.TestCase):
     def test_capabilities_require_exact_valid_compatible_fields(self):
         valid = {
             "protocol_version": 1,
-            "server_version": "2.1.1",
+            "server_version": "2.1.2",
             "max_body_bytes": 48 << 20,
             "tls_fingerprints": FINGERPRINTS,
         }

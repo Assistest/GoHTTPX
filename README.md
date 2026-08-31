@@ -4,7 +4,7 @@ GoHTTPX 保留 HTTPX 的请求编码、Cookie、认证、重定向和 Response �
 
 **2.0 默认自动托管 Go：每个 Python 进程一份 Go，多个 client 共用进程，但各自拥有独立 session 和 Cookie。** 不需要手动启动服务，不需要配置端口或请求密钥。
 
-当前源码版本为 `2.1.1`，支持自定义 TLS JSON，以及从 Wireshark/hex/ClientHello 导入；控制协议仍为 `/api/v1`、`protocol_version=1`，Python 和 Go 必须同版本。公开发布产物见 [PyPI](https://pypi.org/project/gohttpx/) 和 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases)；开发者也可使用下方本地 wheel。
+当前源码版本为 `2.1.2`，支持自定义 TLS JSON，以及从 Wireshark/hex/ClientHello 导入；控制协议仍为 `/api/v1`、`protocol_version=1`，Python 和 Go 必须同版本。公开发布产物见 [PyPI](https://pypi.org/project/gohttpx/) 和 [GitHub Releases](https://github.com/Assistest/GoHTTPX/releases)；开发者也可使用下方本地 wheel。
 
 ## 免责声明
 
@@ -23,7 +23,7 @@ GoHTTPX 是 HTTP 客户端，**只用于你有权访问的接口测试、自动�
 从 PyPI 安装，Go EXE 随 wheel 一起安装，无需另行下载：
 
 ```powershell
-python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.1"
+python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.2"
 ```
 
 `--only-binary=gohttpx` 避免在不支持的平台意外回退到源码编译；本版本不提供 Linux/macOS 托管安装包。
@@ -33,7 +33,7 @@ python -m pip install --upgrade --only-binary=gohttpx "gohttpx==2.1.1"
 ```powershell
 python -m pip install build
 python -m build
-python -m pip install --upgrade dist\gohttpx-2.1.1-py3-none-win_amd64.whl
+python -m pip install --upgrade dist\gohttpx-2.1.2-py3-none-win_amd64.whl
 ```
 
 wheel 内置匹配版本的 Go EXE。部署机器安装 wheel 后不需要 Go 编译器；第一次请求不下载、不编译任何程序。2.0 不再支持只复制一个 `gohttpx.py` 即完成接入。
@@ -190,7 +190,7 @@ for client in (http1, http2, http3, h2c):
 
 ### 自定义 TLS JSON（2.1.0 起）
 
-**整段复制即可运行，不需要下载 JSON 文件，也不要求在仓库目录运行。** 先安装 2.1.1 的完整 wheel。
+**整段复制即可运行，不需要下载 JSON 文件，也不要求在仓库目录运行。** 先安装 2.1.2 的完整 wheel。
 
 此示例把当前开放的 **6 个 TLS 顶层字段全部写出**，以此前的 Edge 151 模板为基础，展开扩展参数。它是一组可运行的配置，不是“已实现浏览器全部功能”的承诺。旧、新 ALPS 互斥，替换方式见代码后。
 
@@ -248,7 +248,11 @@ TLS_SPEC_JSON = r"""
     },
     {"name": "status_request"},
     {"name": "extended_master_secret"},
-    {"name": "encrypted_client_hello"},
+    {
+      "name": "encrypted_client_hello",
+      "candidate_cipher_suites": [{"kdf_id": 1, "aead_id": 3}],
+      "candidate_payload_lens": [160]
+    },
     {"name": "ec_point_formats", "ec_point_format_list": ["uncompressed"]},
     {"name": "supported_versions", "versions": ["GREASE", "TLS 1.3", "TLS 1.2"]},
     {"name": "renegotiation_info"},
@@ -310,7 +314,7 @@ with Client(tls_spec=TLS_SPEC, headers=HEADERS, timeout=20) as client:
 
 同样，证书压缩的 `algorithms` 可选 `brotli`、`zlib`；真实 KeyShare 组支持 `x25519`、`secp256r1`、`secp384r1`、`secp521r1`、`X25519MLKEM768`，且必须列在 `supported_groups`。真实组的密钥由库生成，只有 GREASE 可以填写占位 `key_exchange: [0]`。
 
-`server_name` 的值来自目标 URL，不填写固定域名；random、session ID、真实 KeyShare 不接受固定值。`encrypted_client_hello` 当前仅表示 GREASE ECH，占位扩展不是实际 ECH 加密配置。算法编号可以声明，但不意味着 uTLS 实现了该算法；例如示例中的 `0x0904/0x0905/0x0906` 只验证了发送，未承诺与仅接受这些算法的服务器握手。
+`server_name` 的值来自目标 URL，不填写固定域名；random、session ID、真实 KeyShare 不接受固定值。`encrypted_client_hello` 仅表示 GREASE ECH，占位扩展不是实际 ECH 加密配置；候选 KDF/AEAD 与 payload 长度可配置，Config ID、封装密钥和 payload 内容默认重新生成。算法编号可以声明，但不意味着 uTLS 实现了该算法；例如示例中的 `0x0904/0x0905/0x0906` 只验证了发送，未承诺与只接受这些算法的服务器握手。
 
 字段沿用 uTLS JSON 命名，不接受 `type/alpn/groups` 等简写或任意新增 key。完整扩展字段表、长度限制及边界见 [TLS JSON 配置](docs/tls-json.md)。这段 README 本身是固定测试的数据源：测试执行示例并检查实际 ClientHello，不另外发布需要用户下载的演示 JSON 文件。
 
@@ -320,7 +324,7 @@ with Client(tls_spec=TLS_SPEC, headers=HEADERS, timeout=20) as client:
 
 #### 从 Wireshark / hex 导入
 
-`tls_spec` 除了 JSON，也接受 Wireshark「包字节」hex dump、连续十六进制、原始 ClientHello 字节，或指向这些内容的文件路径。Python 会解析握手结构并生成 JSON；**不会**重放抓包里的 random、session ID、KeyShare 公钥或 SNI。SNI 仍来自请求 URL。GREASE 编号归一化成 `GREASE`。未知扩展、h3 ALPN、真实 ECH 参数等当前接口表达不了的字段会直接报错。
+`tls_spec` 除了 JSON，也接受 Wireshark「包字节」hex dump、连续十六进制、原始 ClientHello 字节，或指向这些内容的文件路径。Python 会解析握手结构并生成 JSON；**不会**重放抓包里的 random、session ID、KeyShare 公钥或 SNI。SNI 仍来自请求 URL。GREASE 编号归一化成 `GREASE`。2.1.2 可导入 `delegated_credentials`、`record_size_limit`、zstd 证书压缩，以及 GREASE ECH 的 KDF/AEAD 和 payload 长度；其他未知扩展、h3 ALPN、真正的 ECH 配置等当前接口表达不了的字段仍会直接报错。
 
 ```python
 from pathlib import Path

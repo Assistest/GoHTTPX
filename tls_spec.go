@@ -241,11 +241,16 @@ func parseTLSExtension(data []byte) (string, utls.TLSExtension, error) {
 	name := header.Name
 	field := map[string]string{
 		"supported_groups": "named_group_list", "ec_point_formats": "ec_point_format_list",
-		"signature_algorithms": "supported_signature_algorithms", "supported_versions": "versions",
+		"signature_algorithms": "supported_signature_algorithms", "delegated_credentials": "supported_signature_algorithms",
+		"supported_versions": "versions", "record_size_limit": "record_size_limit",
 		"application_layer_protocol_negotiation": "protocol_name_list", "key_share": "client_shares",
 		"psk_key_exchange_modes": "ke_modes", "compress_certificate": "algorithms",
 		"application_settings": "supported_protocols", "application_settings_new": "supported_protocols",
 	}[name]
+	if name == "encrypted_client_hello" {
+		extension, err := parseTLSGREASEECH(data)
+		return name, extension, err
+	}
 	required := []string{"name"}
 	if field != "" {
 		required = append(required, field)
@@ -257,6 +262,13 @@ func parseTLSExtension(data []byte) (string, utls.TLSExtension, error) {
 	if name == "key_share" {
 		ext, err := parseTLSKeyShares(fields[field])
 		return name, ext, err
+	}
+	if name == "record_size_limit" {
+		var limit uint16
+		if err := json.Unmarshal(fields[field], &limit); err != nil || limit < 64 || limit > 16385 {
+			return name, nil, errors.New("record_size_limit must be an integer between 64 and 16385")
+		}
+		return name, &utls.FakeRecordSizeLimitExtension{Limit: limit}, nil
 	}
 	var names []string
 	if field != "" {
@@ -281,11 +293,9 @@ func parseTLSExtension(data []byte) (string, utls.TLSExtension, error) {
 		extension = &utls.SessionTicketExtension{}
 	case "renegotiation_info":
 		extension = &utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient}
-	case "encrypted_client_hello":
-		extension = utls.BoringGREASEECH()
-	case "supported_groups", "signature_algorithms":
+	case "supported_groups", "signature_algorithms", "delegated_credentials":
 		dictionary := dicttls.DictSupportedGroupsNameIndexed
-		if name == "signature_algorithms" {
+		if name != "supported_groups" {
 			dictionary = dicttls.DictSignatureSchemeNameIndexed
 		}
 		ids, err := tlsIDs(names, dictionary)
@@ -298,8 +308,14 @@ func parseTLSExtension(data []byte) (string, utls.TLSExtension, error) {
 				ext.Curves = append(ext.Curves, utls.CurveID(id))
 			}
 			extension = ext
-		} else {
+		} else if name == "signature_algorithms" {
 			ext := &utls.SignatureAlgorithmsExtension{}
+			for _, id := range ids {
+				ext.SupportedSignatureAlgorithms = append(ext.SupportedSignatureAlgorithms, utls.SignatureScheme(id))
+			}
+			extension = ext
+		} else {
+			ext := &utls.DelegatedCredentialsExtension{}
 			for _, id := range ids {
 				ext.SupportedSignatureAlgorithms = append(ext.SupportedSignatureAlgorithms, utls.SignatureScheme(id))
 			}
@@ -320,7 +336,7 @@ func parseTLSExtension(data []byte) (string, utls.TLSExtension, error) {
 		extension = &utls.PSKKeyExchangeModesExtension{}
 	case "compress_certificate":
 		for _, algorithm := range names {
-			if algorithm != "brotli" && algorithm != "zlib" {
+			if algorithm != "brotli" && algorithm != "zlib" && algorithm != "zstd" {
 				return name, nil, errors.New("unsupported certificate compression")
 			}
 		}
@@ -347,6 +363,70 @@ func parseTLSExtension(data []byte) (string, utls.TLSExtension, error) {
 		err = json.Unmarshal(data, extension)
 	}
 	return name, extension, err
+}
+
+func parseTLSGREASEECH(data []byte) (*utls.GREASEEncryptedClientHelloExtension, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+		return nil, errors.New("TLS extension must be an object")
+	}
+	for name := range fields {
+		if !slices.Contains([]string{"name", "candidate_cipher_suites", "candidate_config_ids", "candidate_payload_lens"}, name) {
+			return nil, errors.New("TLS extension contains unsupported ECH fields")
+		}
+	}
+	if len(fields) == 1 {
+		return utls.BoringGREASEECH(), nil
+	}
+	ext := &utls.GREASEEncryptedClientHelloExtension{}
+	if raw, ok := fields["candidate_cipher_suites"]; ok {
+		var candidates []json.RawMessage
+		if json.Unmarshal(raw, &candidates) != nil || len(candidates) == 0 || len(candidates) > 8 {
+			return nil, errors.New("candidate_cipher_suites requires 1..8 entries")
+		}
+		seen := map[[2]uint16]bool{}
+		for _, candidate := range candidates {
+			parts, err := tlsObject(candidate, "kdf_id", "aead_id")
+			if err != nil {
+				return nil, err
+			}
+			var kdfID, aeadID uint16
+			if json.Unmarshal(parts["kdf_id"], &kdfID) != nil || json.Unmarshal(parts["aead_id"], &aeadID) != nil ||
+				!slices.Contains([]uint16{1, 2, 3}, kdfID) || !slices.Contains([]uint16{1, 2, 3}, aeadID) || seen[[2]uint16{kdfID, aeadID}] {
+				return nil, errors.New("ECH cipher suite contains unsupported or duplicate kdf_id/aead_id")
+			}
+			seen[[2]uint16{kdfID, aeadID}] = true
+			ext.CandidateCipherSuites = append(ext.CandidateCipherSuites, utls.HPKESymmetricCipherSuite{KdfId: kdfID, AeadId: aeadID})
+		}
+	}
+	if raw, ok := fields["candidate_config_ids"]; ok {
+		var ids []uint16
+		if json.Unmarshal(raw, &ids) != nil || len(ids) == 0 || len(ids) > 32 {
+			return nil, errors.New("candidate_config_ids requires 1..32 byte values")
+		}
+		seen := map[uint8]bool{}
+		for _, value := range ids {
+			id := uint8(value)
+			if value > 255 || seen[id] {
+				return nil, errors.New("candidate_config_ids contains invalid or duplicate values")
+			}
+			seen[id] = true
+			ext.CandidateConfigIds = append(ext.CandidateConfigIds, id)
+		}
+	}
+	if raw, ok := fields["candidate_payload_lens"]; ok {
+		if json.Unmarshal(raw, &ext.CandidatePayloadLens) != nil || len(ext.CandidatePayloadLens) == 0 || len(ext.CandidatePayloadLens) > 8 {
+			return nil, errors.New("candidate_payload_lens requires 1..8 entries")
+		}
+		seen := map[uint16]bool{}
+		for _, size := range ext.CandidatePayloadLens {
+			if size == 0 || size > 4096 || seen[size] {
+				return nil, errors.New("candidate_payload_lens contains invalid or duplicate lengths")
+			}
+			seen[size] = true
+		}
+	}
+	return ext, nil
 }
 
 func parseTLSKeyShares(data []byte) (*utls.KeyShareExtension, error) {

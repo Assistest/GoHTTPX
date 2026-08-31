@@ -1,5 +1,11 @@
 # 更新记录
 
+## 2.1.2（2026-08-31）
+
+- ClientHello hex 导入增加 `delegated_credentials`、`record_size_limit` 和 `zstd` 证书压缩，不再拒绝包含这些正常浏览器扩展的抓包。
+- GREASE ECH JSON 增加候选 KDF/AEAD、Config ID 和 payload 长度；hex 导入保留可表达的算法与长度，同时继续重新生成 Config ID、封装密钥和 payload 内容。
+- 增加严格参数边界、Python 转换测试和本机服务器实际 ClientHello 回归；仍不把 GREASE ECH 描述成真正的 ECH 加密。
+
 ## 2.1.1（2026-08-28）
 
 - Python 新增 `tls_spec_from_client_hello`；`tls_spec` 可直接接受 Wireshark hex dump、ClientHello 字节或文件路径，转换成现有 JSON，不重放抓包动态字段。

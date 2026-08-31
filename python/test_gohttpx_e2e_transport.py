@@ -89,6 +89,39 @@ class TransportE2ETests(unittest.TestCase):
                          [normalize(ext["id"]) for ext in second["hello"]["extensions"]])
         self.assertNotEqual(first["hello"]["random"], second["hello"]["random"])
 
+    def test_hex_import_preserves_modern_browser_extensions_on_the_wire(self):
+        spec = self.custom_hello()
+        spec["extensions"][7]["algorithms"] = ["zlib", "brotli", "zstd"]
+        spec["extensions"][-1:-1] = [
+            {"name": "delegated_credentials", "supported_signature_algorithms": ["ecdsa_secp256r1_sha256", "ecdsa_secp384r1_sha384", "0x0603"]},
+            {"name": "record_size_limit", "record_size_limit": 16385},
+            {"name": "encrypted_client_hello", "candidate_cipher_suites": [{"kdf_id": 1, "aead_id": 3}], "candidate_payload_lens": [223]},
+        ]
+        with TLSCaptureTarget(self.target) as target:
+            with Client(go_endpoint=self.service.endpoint, go_token=self.service.token,
+                        verify=self.target.ca_path, tls_spec=spec) as client:
+                first = client.get(target.endpoint).json()
+        converted = tls_spec_from_client_hello(bytes.fromhex(first["raw_hello"]))
+        converted_extensions = {item["name"]: item for item in converted["extensions"]}
+        self.assertEqual(converted_extensions["record_size_limit"]["record_size_limit"], 16385)
+        self.assertEqual(converted_extensions["compress_certificate"]["algorithms"], ["zlib", "brotli", "zstd"])
+        self.assertEqual(converted_extensions["encrypted_client_hello"]["candidate_cipher_suites"], [{"kdf_id": 1, "aead_id": 3}])
+        self.assertEqual(converted_extensions["encrypted_client_hello"]["candidate_payload_lens"], [223])
+
+        with TLSCaptureTarget(self.target) as target:
+            with Client(go_endpoint=self.service.endpoint, go_token=self.service.token,
+                        verify=self.target.ca_path, tls_spec=converted) as client:
+                second = client.get(target.endpoint).json()
+        extensions = {ext["id"]: bytes.fromhex(ext["data"]) for ext in second["hello"]["extensions"]}
+        self.assertEqual(extensions[34], b"\x00\x06\x04\x03\x05\x03\x06\x03")
+        self.assertEqual(extensions[28], b"\x40\x01")
+        self.assertEqual(extensions[27], b"\x06\x00\x01\x00\x02\x00\x03")
+        self.assertEqual(extensions[65037][:5], b"\x00\x00\x01\x00\x03")
+        encapsulated, offset = int.from_bytes(extensions[65037][6:8], "big"), 8
+        self.assertEqual(encapsulated, 32)
+        offset += encapsulated
+        self.assertEqual(int.from_bytes(extensions[65037][offset:offset + 2], "big"), 239)
+
     def test_custom_tls_json_is_visible_in_actual_client_hello_and_regenerates_keys(self):
         with TLSCaptureTarget(self.target) as target:
             with Client(go_endpoint=self.service.endpoint, go_token=self.service.token,
@@ -222,7 +255,10 @@ class TransportE2ETests(unittest.TestCase):
             self.assertEqual(extensions[5], b"\x01\x00\x00\x00\x00")
             for empty in (35, 23, 18):
                 self.assertEqual(extensions[empty], b"")
-            self.assertGreater(len(extensions[65037]), 100)
+            self.assertEqual(extensions[65037][:5], b"\x00\x00\x01\x00\x03")
+            self.assertEqual(extensions[65037][6:8], b"\x00\x20")
+            self.assertEqual(extensions[65037][40:42], b"\x00\xb0")
+            self.assertEqual(len(extensions[65037]), 218)
             self.assertEqual(extensions[51][7:11], b"\x11\xec\x04\xc0")
             self.assertEqual(extensions[51][1227:1231], b"\x00\x1d\x00\x20")
             self.assertEqual(len(extensions[51]), 1263)

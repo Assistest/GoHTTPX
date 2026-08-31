@@ -1,6 +1,6 @@
 # TLS JSON 配置与实际报文验证
 
-适用于源码版本 2.1.1。Python SDK 与 Go EXE 必须同版本；旧版不具备此入口。`tls_spec` JSON 自 2.1.0 起可用，ClientHello hex 导入自 2.1.1 起可用。
+适用于源码版本 2.1.2。Python SDK 与 Go EXE 必须同版本；旧版不具备此入口。`tls_spec` JSON 自 2.1.0 起可用，ClientHello hex 导入自 2.1.1 起可用，现代浏览器扩展及 GREASE ECH 参数导入自 2.1.2 起可用。
 
 自定义 TLS 只用于你有权测试的接口请求。禁止用于未授权访问、绕过安全控制或任何违法用途，完整条款见 [README 免责声明](../README.md#免责声明)。
 
@@ -49,7 +49,7 @@ asyncio.run(main())
 - TLS record 或 handshake 原始字节
 - 上述内容的文件路径
 
-转换结果是当前接口能表达的配置，不是原包逐字节重放。random、session ID、KeyShare 公钥、GREASE 具体编号和 SNI 主机名都会丢弃，由新连接生成。`encrypted_client_hello` 只声明 GREASE ECH，不能还原抓包中的 AEAD/payload。未知扩展会报错，不会填成 GenericExtension。
+转换结果是当前接口能表达的配置，不是原包逐字节重放。random、session ID、KeyShare 公钥、GREASE 具体编号和 SNI 主机名都会丢弃，由新连接生成。GREASE ECH 会保留可表达的 KDF/AEAD 和 payload 长度，不复制 Config ID、封装密钥或 payload 内容。未知扩展会报错，不会填成 GenericExtension。
 
 ## 支持的扩展
 
@@ -64,7 +64,7 @@ asyncio.run(main())
 | `extended_master_secret` | 无 |
 | `session_ticket` | 无；只声明扩展，不允许导入票据 |
 | `renegotiation_info` | 无；使用 uTLS 的初始握手声明 |
-| `encrypted_client_hello` | 无；生成 BoringSSL 风格 GREASE ECH，不是实际的 ECH 加密配置 |
+| `encrypted_client_hello` | 可选 `candidate_cipher_suites`（1–8 个 `kdf_id`/`aead_id`）、`candidate_config_ids`（1–32 个字节值）、`candidate_payload_lens`（1–8 个 1–4096 的明文长度）；全部省略时沿用 BoringSSL GREASE ECH 默认值，不是真正的 ECH 加密配置 |
 | `supported_groups` | `named_group_list`：组名数组，如 `GREASE`、`x25519`、`secp256r1`、`secp384r1`、`X25519MLKEM768` 或十六进制编号 |
 | `ec_point_formats` | `ec_point_format_list`：只允许 `["uncompressed"]` |
 | `signature_algorithms` | `supported_signature_algorithms`：算法名、`GREASE` 或十六进制编号数组 |
@@ -72,11 +72,13 @@ asyncio.run(main())
 | `key_share` | `client_shares`：1–4 个 `{ "group": "x25519" }` 等对象；组必须存在于 supported_groups |
 | `application_layer_protocol_negotiation` | `protocol_name_list`：`h2` / `http/1.1` 数组 |
 | `psk_key_exchange_modes` | `ke_modes`：只允许 `["psk_dhe_ke"]` |
-| `compress_certificate` | `algorithms`：`brotli` / `zlib` 数组 |
+| `compress_certificate` | `algorithms`：`brotli` / `zlib` / `zstd` 数组 |
+| `record_size_limit` | `record_size_limit`：64–16385；uTLS 只发送声明，不实现该限制的记录层行为 |
+| `delegated_credentials` | `supported_signature_algorithms`：非空签名算法数组；uTLS 只发送声明，不实现服务端 Delegated Credential 验证 |
 | `application_settings` | `supported_protocols`：ALPN 中已有的协议；旧码点 17513 |
 | `application_settings_new` | `supported_protocols`：ALPN 中已有的协议；新码点 17613，不与旧版同时使用 |
 
-其他扩展目前返回错误，不会转换成无内容的 GenericExtension。参数数组非空、最多 64 项、名称最多 128 字符，重复名称/编号被拒绝。
+其他扩展目前返回错误，不会转换成无内容的 GenericExtension。证书压缩还支持 `zstd`。参数数组非空、最多 64 项、名称最多 128 字符，重复名称/编号被拒绝。
 
 KeyShare 支持 x25519、secp256r1、secp384r1、secp521r1、X25519MLKEM768。真实组不接受 `key_exchange`，必须由 uTLS 生成新的密钥材料。GREASE 组可省略 `key_exchange`，或使用官方样例的 `[0]`。在接受十六进制编号的位置，`0x1a1a` 等 GREASE 编号与 `GREASE` 一样按占位符处理，不能用不同编号绕过重复检查。不接受抓包中的静态公钥、随机数、session ID、PSK、票据或自定义回调。
 
